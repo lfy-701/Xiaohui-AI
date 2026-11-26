@@ -1,0 +1,1086 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>小慧 · 在线互动</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:"Microsoft YaHei",system-ui,sans-serif;background:#eef5fb;color:#243b53;height:100vh;display:flex;flex-direction:column}
+  header{background:#fff;border-bottom:1px solid #dbeafe;padding:12px 20px;display:flex;align-items:center;gap:12px}
+  header h1{font-size:17px;font-weight:600;color:#1b6fc4}
+  header .dot{width:8px;height:8px;border-radius:50%;background:#94a3b8;flex:none}
+  header .dot.on{background:#22c55e}
+  header .dot.off{background:#ef4444}
+  header .dev{font-size:12px;color:#7c93a8;background:#f1f7fd;border:1px solid #dbeafe;border-radius:999px;padding:3px 10px}
+  header .sp{flex:1}
+  header a{font-size:13px;color:#5a7a99;text-decoration:none}
+  main{flex:1;display:flex;overflow:hidden}
+  #msgs{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
+  .msg{max-width:70%;padding:10px 14px;border-radius:14px;line-height:1.6;font-size:14.5px;white-space:pre-wrap}
+  .me{align-self:flex-end;background:#1b6fc4;color:#fff;border-bottom-right-radius:4px}
+  .bot{align-self:flex-start;background:#fff;border:1px solid #dbeafe;border-bottom-left-radius:4px}
+  .sys{align-self:center;font-size:12px;color:#7c93a8;background:#e2edf7;padding:4px 12px;border-radius:10px;max-width:80%;text-align:center}
+  .sys.err{color:#b91c1c;background:#fee2e2}
+  .sys.ok{color:#15803d;background:#dcfce7}
+  aside{width:240px;background:#fff;border-left:1px solid #dbeafe;padding:16px;overflow-y:auto}
+  aside h2{font-size:13px;color:#7c93a8;margin:0 0 10px;font-weight:600;letter-spacing:.5px}
+  .acts{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:18px}
+  .acts button{border:1px solid #dbeafe;background:#f7fbff;color:#1b6fc4;border-radius:9px;padding:9px 4px;font-size:13px;cursor:pointer;transition:.15s}
+  .acts button:hover{background:#e8f2fd;border-color:#a9cff5}
+  .acts button:active{transform:scale(.96)}
+  .acts button:disabled{opacity:.45;cursor:default}
+  footer{border-top:1px solid #dbeafe;background:#fff;padding:12px 20px;display:flex;gap:10px}
+  footer input{flex:1;border:1px solid #cfe3f7;border-radius:10px;padding:11px 14px;font-size:14.5px;outline:none;font-family:inherit}
+  footer input:focus{border-color:#7fb6e8}
+  footer button{border:0;background:#1b6fc4;color:#fff;border-radius:10px;padding:0 22px;font-size:14.5px;cursor:pointer}
+  footer button:disabled{opacity:.5;cursor:default}
+</style>
+<style>
+.xh-sw{width:28px;height:28px;border-radius:8px;display:inline-block;cursor:pointer;border:2px solid #fff;box-shadow:0 0 0 1px #dbe7f5;transition:.15s}
+.xh-sw:hover{transform:scale(1.08)}
+.xh-sv{margin-bottom:10px}
+.xh-sv label{display:flex;justify-content:space-between;font-size:12px;color:#5b7590;margin-bottom:4px}
+.xh-sv label b{color:#1b6fc4}
+.xh-sv input[type=range]{width:100%;height:5px;border-radius:3px;background:#e3eefb;-webkit-appearance:none;outline:none}
+.xh-sv input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;background:#1b6fc4;border:2px solid #fff;box-shadow:0 1px 3px rgba(27,111,196,.4);cursor:pointer}
+.xh-act{display:flex;align-items:center;gap:6px;padding:6px 0;border-bottom:1px solid #eaf1fa;font-size:12.5px}
+.xh-act .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.xh-act button{padding:3px 8px;font-size:11.5px}
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>小慧 · 在线互动</h1>
+  <span class="dev" id="dev">检查设备…</span>
+  <span class="sp"></span>
+  <a href="/">← 返回控制台</a>
+</header>
+<main>
+  <div id="msgs"></div>
+  <aside>
+    <h2>动作控制</h2>
+  <div class="acts" id="actGrid"></div>
+  <div id="xhTuneBar" style="display:none;margin:6px 0 12px;padding:8px 10px;border:1px solid #cfe3f7;border-radius:8px;background:#f2f8ff">
+    <div style="font-size:12.5px;margin-bottom:6px">正在调整「<b id="xhTuneName"></b>」：拖动下面的滑块，角度满意后保存</div>
+    <div style="display:flex;gap:6px">
+      <button type="button" onclick="xhTuneSave()" style="flex:1;font-size:12px;padding:6px">保存为这个动作</button>
+      <button type="button" onclick="xhTuneCancel()" style="font-size:12px;padding:6px">取消</button>
+    </div>
+  </div>
+
+  <h2>舵机微调</h2>
+    <div id="xhServos"></div>
+    <div style="display:flex;gap:6px;margin:8px 0 16px">
+      <input id="xhActName" placeholder="动作名" style="flex:1;min-width:0;font-size:12.5px;padding:7px 10px;border:1px solid #dbe7f5;border-radius:8px;background:#fbfdff;font-family:inherit;outline:none">
+      <button type="button" onclick="xhRunPose()" style="padding:7px 10px;font-size:12.5px">执行</button>
+      <button type="button" onclick="xhSaveAction()" style="padding:7px 10px;font-size:12.5px">保存</button>
+    </div>
+
+    
+    <h2>动作编排（连续动作）</h2>
+    <div id="seqPanel" style="border:1px solid #cfe3f7;border-radius:10px;padding:10px;background:#f7fbff">
+      <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px">
+        <input id="seqName" placeholder="动作名，例如 我的舞蹈" style="flex:1;padding:6px;border:1px solid #cfe3f7;border-radius:8px">
+        <span style="font-size:12px">循环</span>
+        <input id="seqLoops" type="number" min="1" max="20" value="3" style="width:56px;padding:6px;border:1px solid #cfe3f7;border-radius:8px">
+      </div>
+      <div style="display:flex;gap:6px;margin-bottom:8px">
+        <button onclick="seqAddStep()" style="flex:1">＋ 添加当前姿态</button>
+        <button onclick="seqPlay()">▶ 试播</button>
+        <button onclick="seqSave()">💾 保存</button>
+      </div>
+      <div id="seqSteps" style="font-size:12px;color:#41556b;margin-bottom:8px">还没有步骤</div>
+      <div id="seqList" style="font-size:12.5px"></div>
+    </div>
+
+<h2>已保存动作</h2>
+    <div id="xhActList" style="margin-bottom:16px"><div class="hint">加载中…</div></div>
+
+    <h2>灯珠</h2>
+    <div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:8px">
+      <span class="xh-sw" style="background:#ff3b30" onclick="xhLed('255,0,0')"></span>
+      <span class="xh-sw" style="background:#34c759" onclick="xhLed('0,255,0')"></span>
+      <span class="xh-sw" style="background:#007aff" onclick="xhLed('0,0,255')"></span>
+      <span class="xh-sw" style="background:#ffd60a" onclick="xhLed('255,200,0')"></span>
+      <span class="xh-sw" style="background:#af52de" onclick="xhLed('180,0,255')"></span>
+      <span class="xh-sw" style="background:#f2f2f7" onclick="xhLed('255,255,255')"></span>
+    </div>
+    <div style="display:flex;gap:6px;margin-bottom:16px">
+      <button type="button" onclick="xhLed('rainbow')" style="flex:1;padding:6px;font-size:12px">彩虹</button>
+      <button type="button" onclick="xhLed('breathing')" style="flex:1;padding:6px;font-size:12px">呼吸</button>
+      <button type="button" onclick="xhLed('off')" style="flex:1;padding:6px;font-size:12px">关灯</button>
+    </div>
+
+
+    <h2>服务调用</h2>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+      <button type="button" onclick="xhServiceCall('weather')" style="flex:1;padding:6px;font-size:12px">天气</button>
+      <button type="button" onclick="xhServiceCall('news')" style="flex:1;padding:6px;font-size:12px">新闻</button>
+      <button type="button" onclick="xhServiceCall('search')" style="flex:1;padding:6px;font-size:12px">搜索</button>
+    </div>
+    <div style="display:flex;gap:6px;margin-bottom:16px">
+      <input id="xhMcpName" placeholder="工具名，如 get_current_weather"
+             style="flex:1;min-width:0;font-size:12px;padding:6px 9px;border:1px solid #dbe7f5;border-radius:8px;background:#fbfdff;font-family:inherit;outline:none">
+      <button type="button" onclick="xhMcpCall()" style="padding:6px 10px;font-size:12px">调用</button>
+    </div>
+
+    <h2>放歌</h2>
+    <div style="display:flex;gap:6px;margin-bottom:8px">
+      <input id="xhSongQ" placeholder="歌名，如：晴天" style="flex:1;min-width:0;font-size:12.5px;padding:7px 10px;border:1px solid #dbe7f5;border-radius:8px;background:#fbfdff;font-family:inherit;outline:none"
+             onkeydown="if(event.key==='Enter')xhMusicSearch()">
+      <button type="button" onclick="xhMusicSearch()" style="padding:7px 12px;font-size:12.5px">搜索</button>
+    </div>
+    <div id="xhSongList" style="margin-bottom:8px"></div>
+    <div style="display:flex;gap:6px;margin-bottom:16px">
+      <button type="button" onclick="xhMusicStop()" style="flex:1;padding:6px;font-size:12px">暂停播放</button>
+    </div>
+    <h2>设备声音</h2>
+    <div style="margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:#5b7590;margin-bottom:4px">
+        <span>音量</span><b id="xhVolVal" style="color:#1b6fc4">70</b>
+      </div>
+      <input type="range" id="xhVolSlider" min="0" max="100" step="5" value="70"
+             style="width:100%;height:5px;border-radius:3px;background:#e3eefb;-webkit-appearance:none;outline:none"
+             oninput="document.getElementById('xhVolVal').textContent=this.value"
+             onchange="xhSetVol(this.value)">
+      <div style="display:flex;gap:6px;margin-top:8px">
+        <button type="button" onclick="xhFixSound()" style="flex:1;padding:6px;font-size:12px">恢复声音</button>
+        <button type="button" onclick="xhTestSound()" style="flex:1;padding:6px;font-size:12px">试听</button>
+      </div>
+    </div>
+    <h2>提示</h2>
+    <p style="font-size:12.5px;color:#7c93a8;line-height:1.7">
+      动作经语音服务的 MCP 通道实时下发，通常 1 秒内执行。<br>
+      设备离线时会直接提示，不再假装已下发。<br>
+      打字对话由云端模型回复，页面会自动朗读。
+    </p>
+  </aside>
+</main>
+<footer>
+  <input id="in" placeholder="和小慧说点什么…（回车发送）" autocomplete="off">
+  <button id="send">发送</button>
+</footer>
+<script>
+const msgs = document.getElementById('msgs');
+const input = document.getElementById('in');
+const sendBtn = document.getElementById('send');
+const devBadge = document.getElementById('dev');
+const dot = document.getElementById('dot');
+let agentId = '';
+
+function add(text, cls) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  d.textContent = text;
+  msgs.appendChild(d);
+  msgs.scrollTop = msgs.scrollHeight;
+  return d;
+}
+
+function speak(text) {
+  if (!window.speechSynthesis || !text) return;
+  try {
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text.slice(0, 200));
+    u.lang = 'zh-CN';
+    u.rate = 1.05;
+    speechSynthesis.speak(u);
+  } catch (e) {}
+}
+
+// 设备状态：直连语音服务的控制接口（经控制台后端代理）
+async function refreshStatus() {
+  try {
+    const r = await fetch('/api/console/status');
+    const d = await r.json();
+    const ready = (d.devices || []).filter(x => x.mcp_ready);
+    if (d.ok && ready.length) {
+      dot.className = 'dot on';
+      devBadge.textContent = '在线 · ' + ready[0].device_id + ' · ' + ready[0].tools + ' 个工具';
+    } else {
+      dot.className = 'dot off';
+      devBadge.textContent = d.ok ? '设备离线（等待连接）' : '语音服务不可用';
+    }
+  } catch (e) {
+    dot.className = 'dot off';
+    devBadge.textContent = '语音服务不可用';
+  }
+}
+
+// 动作按钮：改调 /api/console/action
+document.querySelectorAll('.acts button').forEach(b => {
+  b.onclick = async () => {
+    const action = b.dataset.a;
+    const label = b.textContent;
+    b.disabled = true;
+    add('▸ 指令：' + label, 'sys');
+    try {
+      const r = await fetch('/api/console/action', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({action})
+      });
+      let d = {};
+      try { d = await r.json(); } catch (e) {}
+      if (d.ok) {
+        const ms = d.latency_ms != null ? '（' + d.latency_ms + ' ms）' : '';
+        add('✓ ' + (d.tip || label) + ' ' + ms, 'sys ok');
+      } else {
+        add('✗ ' + (d.error || d.detail || ('下发失败（HTTP ' + r.status + '）')), 'sys err');
+      }
+    } catch (e) {
+      add('✗ 网络错误：' + e.message, 'sys err');
+    } finally {
+      b.disabled = false;
+      refreshStatus();
+    }
+  };
+});
+
+async function loadAgent() {
+  try {
+    const d = await fetch('/api/agents').then(r => r.json());
+    const list = d.agents || d || [];
+    if (list.length) agentId = list[0].id;
+  } catch (e) {}
+}
+
+// 对话
+async function send() {
+  const text = input.value.trim();
+  if (!text) return;
+  if (isWakeText(text)) {
+    input.value = "";
+    add(text, "me");
+    if (typeof xhWakeByText === "function") xhWakeByText();
+    return;
+  }
+  if (!agentId) {
+    add('✗ 没有可用智能体，请先在控制台创建', 'sys err');
+    return;
+  }
+  input.value = '';
+  sendBtn.disabled = true;
+  add(text, 'me');
+  // 并行预热：模型思考的同时先把设备连上（省掉回复后的 2~3 秒连接等待）
+  (async function preConnect() {
+    try {
+      const st = await (await fetch("/api/console/status")).json();
+      if (!st || !st.count) {
+        fetch("/api/device/push", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({action: "connect"})
+        }).catch(() => {});
+      }
+    } catch (e) {}
+  })();
+  const thinking = add('小慧正在想…', 'sys');
+  try {
+    const r = await fetch(`/api/agents/${agentId}/chat`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text, session_id: 'chat-page'})
+    });
+    const d = await r.json();
+    thinking.remove();
+    const reply = d.reply || d.content || d.text || '(没有回复)';
+    add(reply, 'bot');
+    // 网页 → 设备发声（/api/console/speak：自动唤醒 + tts start + 推流）
+    try {
+      add('… 正在让设备说话', 'sys');
+      const sr = await fetch('/api/console/speak', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text: reply.replace(/\s*——\s*[^\s]+?:latest\s*$/i, '').replace(/\s*——\s*[^\s]+?\s*$/i, '').trim().slice(0, 200)})
+      });
+      const sd = await sr.json();
+      if (sd && sd.ok) add('♪ 设备已发声（' + (sd.packets || 0) + ' 帧）', 'sys ok');
+      else add('… 设备没响应：' + ((sd && sd.error) || '未知原因'), 'sys');
+    } catch (e) {
+      add('✗ 设备播报失败：' + e.message, 'sys err');
+    }
+    // 默认只用设备发声；浏览器朗读由开关控制
+    if (window.xhPcSpeak) speak(reply);
+  } catch (e) {
+    thinking.remove();
+    add('✗ 发送失败：' + e.message, 'sys err');
+  } finally {
+    sendBtn.disabled = false;
+    input.focus();
+  }
+}
+
+sendBtn.onclick = send;
+input.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+
+loadAgent();
+refreshStatus();
+setInterval(refreshStatus, 800);   // 0.8 秒一次，连接状态更快反映
+input.focus();
+
+
+  // ---------------- 打字唤醒 ----------------
+  // 输入唤醒词时：让设备应一声，并把后续输入当作对话
+  const WAKE_WORDS = ['你好小慧', '小慧小慧', '嘿小慧', '小慧'];
+  let wokeAt = 0;
+
+  function isWakeText(t) {
+    const s = (t || '').replace(/[\s，。！？,.!?]/g, '');
+    return WAKE_WORDS.some(w => s === w || s === w + '小慧');
+  }
+
+  async function xhWakeByText() {
+    add('▸ 唤醒：你好小慧', 'sys');
+    // 1) 先让设备主动建立语音连接
+    try {
+      await fetch("/api/device/push", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({action: "connect"})
+      });
+    } catch (e) {}
+    add("… 正在连接设备", "sys");
+    // 2) 轮询连接状态：连上就立刻播报（最多等 5 秒）
+    let connected = false;
+    for (let i = 0; i < 17; i++) {
+      try {
+        const st = await fetch("/api/console/status").then(function (x) { return x.json(); });
+        if (st && st.count > 0) { connected = true; break; }
+      } catch (e) {}
+      await new Promise(function (r) { setTimeout(r, 300); });
+    }
+    if (!connected) add("… 设备还没连上，再等一下", "sys");
+    // 3) 建立连接后播报应答
+    const r = await xhSay("嗯，我在呢，你说。");
+    if (r && r.ok) {
+      wokeAt = Date.now();
+      add('✓ 设备已唤醒，可以直接说话或打字', 'sys ok');
+    } else {
+      add('✗ 唤醒失败：' + ((r && r.error) || '设备未连接'), 'sys err');
+    }
+  }
+  window.xhWakeByText = xhWakeByText;
+
+  // 让设备把这句话说出来（需要设备在线）
+
+  // 确保设备处于连接状态；未连接则下发 connect 并等待
+  async function xhEnsureDevice(timeoutMs) {
+    const limit = timeoutMs || 12000;
+    const t0 = Date.now();
+    try {
+      const st = await (await fetch('/api/console/status')).json();
+      if (st && st.count > 0) return true;
+    } catch (e) {}
+    try {
+      await fetch('/api/device/push', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({action: 'connect'})
+      });
+    } catch (e) { return false; }
+    add('… 正在唤醒设备', 'sys');
+    while (Date.now() - t0 < limit) {
+      await new Promise(r => setTimeout(r, 600));
+      try {
+        const st = await (await fetch('/api/console/status')).json();
+        if (st && st.count > 0) return true;
+      } catch (e) {}
+    }
+    return false;
+  }
+
+
+  // 探活：返回当前语音连接数
+  async function xhCount() {
+    try {
+      const st = await (await fetch('/api/console/status')).json();
+      return (st && st.count) || 0;
+    } catch (e) { return 0; }
+  }
+
+  // 推音频；连接断了就重连一次再推（设备播完就断，要抢时间窗）
+  async function xhSaySafe(text) {
+    if (!text) return false;
+    if ((await xhCount()) > 0) {
+      const r = await xhSay(text);
+      if (r && r.ok) return true;
+    }
+    // 重连
+    try {
+      await fetch('/api/device/push', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({action: 'connect'})
+      });
+    } catch (e) { return false; }
+    for (let i = 0; i < 16; i++) {
+      await new Promise(r => setTimeout(r, 400));
+      if ((await xhCount()) > 0) {
+        const r = await xhSay(text);
+        return !!(r && r.ok);
+      }
+    }
+    return false;
+  }
+
+  async function xhSay(text) {
+    try {
+      const r = await fetch('/api/console/say', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text})
+      });
+      const d = await r.json();
+      if (!d.ok) add('✗ ' + (d.error || '设备未在线'), 'sys');
+      return d;
+    } catch (e) { return {ok: false}; }
+  }
+  window.xhSay = xhSay;
+
+
+  // ---------------- 舵机 / 灯珠（并入动作编辑） ----------------
+  const XH_SERVO_NAMES = ['左前', '左后', '右前', '右后'];
+  let xhAngles = [90, 90, 90, 90];
+
+  function xhRenderServos() {
+    const box = document.getElementById('xhServos');
+    if (!box) return;
+    box.innerHTML = xhAngles.map(function (v, i) {
+      return '<div class="xh-sv"><label><span>' + XH_SERVO_NAMES[i] + '</span>' +
+             '<b id="xhv' + i + '">' + v + '°</b></label>' +
+             '<input type="range" id="xhr' + i + '" min="0" max="180" value="' + v + '" ' +
+             'oninput="xhSlide(' + i + ', this.value)"></div>';
+    }).join('');
+  }
+
+  // 拖动即下发：节流 120ms，只发最新值
+  const xhPending = {};
+  const xhTimer = {};
+  const xhLast = {};
+
+  function xhSlide(i, v) {
+    xhAngles[i] = parseInt(v);
+    const el = document.getElementById('xhv' + i);
+    if (el) el.textContent = v + '°';
+    xhPending[i] = xhAngles[i];
+    clearTimeout(xhTimer[i]);
+    xhTimer[i] = setTimeout(function () {
+      xhSendServo(i, xhPending[i]);
+    }, 60);
+  }
+
+  async function xhSendServo(i, angle) {
+    const now = Date.now();
+    if (xhLast[i] && now - xhLast[i] < 110) return;
+    xhLast[i] = now;
+    try {
+      const r = await fetch('/api/console/action', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({tool: 'self.set_servo', arguments: {servo: i, angle: angle}})
+      });
+      if (!r.ok) xhServoFallback();
+    } catch (e) {
+      xhServoFallback();
+    }
+  }
+
+  // MCP 不可用时退回心跳队列（慢但能到）
+  function xhServoFallback() {
+    fetch('/api/device/pose', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({angles: xhAngles.join(',')})
+    }).catch(function () {});
+  }
+
+  async function xhRunPose() {
+    const r = await fetch('/api/device/pose', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({angles: xhAngles.join(',')})
+    });
+    const d = await r.json();
+    add(d.ok ? ('▸ 姿态：' + d.angles) : ('✗ ' + (d.detail || '下发失败')), d.ok ? 'sys' : 'sys err');
+  }
+
+  async function xhSaveAction() {
+    const el = document.getElementById('xhActName');
+    const name = (el.value || '').trim();
+    if (!name) { add('✗ 先填动作名', 'sys err'); return; }
+    const r = await fetch('/api/actions', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name, angles: xhAngles.join(',')})
+    });
+    const d = await r.json();
+    if (d.ok) { el.value = ''; add('✓ 已保存「' + name + '」', 'sys ok'); xhLoadActions(); }
+    else add('✗ 保存失败', 'sys err');
+  }
+
+  async function xhLoadActions() {
+    const box = document.getElementById('xhActList');
+    if (!box) return;
+    try {
+      const d = await (await fetch('/api/actions')).json();
+      const list = d.actions || [];
+      if (!list.length) { box.innerHTML = '<div class="hint">还没有保存的动作</div>'; return; }
+      box.innerHTML = list.map(function (a) {
+        return '<div class="xh-act"><span class="nm">' + a.name + '</span>' +
+               '<span class="hint" style="font-size:11px">' + a.angles + '</span>' +
+               '<button type="button" onclick="xhExec(\'' + a.angles + '\',\'' + a.name + '\')">执行</button>' +
+               '<button type="button" onclick="xhDelAction(' + a.id + ')">删</button></div>';
+      }).join('');
+    } catch (e) {
+      box.innerHTML = '<div class="hint">加载失败</div>';
+    }
+  }
+
+  async function xhExec(angles, name) {
+    const r = await fetch('/api/device/pose', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({angles: angles})
+    });
+    const d = await r.json();
+    add(d.ok ? ('▸ 执行「' + name + '」') : '✗ 执行失败', d.ok ? 'sys' : 'sys err');
+  }
+
+  async function xhDelAction(id) {
+    if (!confirm('删除这个动作？')) return;
+    await fetch('/api/actions/' + id, {method: 'DELETE'});
+    xhLoadActions();
+  }
+
+  async function xhLed(v) {
+    const r = await fetch('/api/device/led', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({value: v})
+    });
+    const d = await r.json();
+    add(d.ok ? '▸ 灯效已下发' : '✗ 灯效失败', d.ok ? 'sys' : 'sys err');
+  }
+
+  window.xhRunPose = xhRunPose;
+  window.xhSaveAction = xhSaveAction;
+  window.xhSlide = xhSlide;
+  window.xhExec = xhExec;
+  window.xhDelAction = xhDelAction;
+  window.xhLed = xhLed;
+
+  xhRenderServos();
+  xhLoadActions();
+
+  const xhVol = document.getElementById('xhVol');
+  if (xhVol && xhVol.style) {
+    const st = document.createElement('style');
+    st.textContent = '#xhVol::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;background:#1b6fc4;border:2px solid #fff;box-shadow:0 1px 3px rgba(27,111,196,.4);cursor:pointer}';
+    document.head.appendChild(st);
+  }
+  async function xhSetVol(v) {
+    try {
+      const r = await fetch('/api/device/push', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({action: 'volume', value: String(v)})
+      });
+      const d = await r.json();
+      add(d.ok ? ('▸ 音量设为 ' + v) : '✗ 音量设置失败', d.ok ? 'sys' : 'sys err');
+    } catch (e) {}
+  }
+  window.xhSetVol = xhSetVol;
+  window.xhPcSpeak = false;   // 电脑朗读默认关闭，只让设备说话
+  async function xhPlayMusic() {
+    const el = document.getElementById('xhSongQ');
+    const q = (el.value || '').trim();
+    if (!q) { add('✗ 先输入歌名', 'sys err'); return; }
+    add('▸ 搜索：' + q, 'sys');
+    try {
+      const r = await fetch('/api/music/play_device', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({query: q})
+      });
+      const d = await r.json();
+      if (d.ok) {
+        const s = d.song || {};
+        add('♪ 正在播放：' + (s.name || q) + ' — ' + (s.artist || '') + '（' + (d.seconds || 30) + ' 秒）', 'sys ok');
+      } else {
+        add('✗ ' + (d.error || d.detail || '播放失败'), 'sys err');
+      }
+    } catch (e) { add('✗ 播放失败', 'sys err'); }
+  }
+  window.xhPlayMusic = xhPlayMusic;
+  async function xhFixSound() {
+    try {
+      await fetch('/api/device/push', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({action:'volume', value:'90'})});
+      add('▸ 已把设备音量设为 90', 'sys ok');
+      await new Promise(r => setTimeout(r, 1800));
+      const ok = await xhSaySafe('声音已经调好了，能听到吗');
+      if (!ok) add('… 设备没连上，先唤醒它', 'sys');
+    } catch (e) { add('✗ 恢复失败：' + e.message, 'sys err'); }
+  }
+  window.xhFixSound = xhFixSound;
+  async function xhSetVol(v) {
+    try {
+      const r = await fetch('/api/device/push', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({action:'volume', value:String(v)})});
+      const d = await r.json();
+      add(d.ok ? ('▸ 音量设为 ' + v) : '✗ 音量设置失败', d.ok ? 'sys' : 'sys err');
+      localStorage.setItem('xhVol', String(v));
+    } catch (e) { add('✗ 音量设置失败', 'sys err'); }
+  }
+
+  async function xhTestSound() {
+    const v = document.getElementById('xhVolSlider');
+    const ok = await xhSaySafe('这是音量测试，' + (v ? v.value : 70) + ' 的声音大小');
+    if (!ok) add('… 设备没连上', 'sys');
+  }
+
+  window.xhSetVol = xhSetVol;
+  window.xhTestSound = xhTestSound;
+
+  // 记住上次音量
+  (function(){
+    try {
+      const saved = localStorage.getItem('xhVol');
+      const el = document.getElementById('xhVolSlider');
+      if (saved && el) { el.value = saved; document.getElementById('xhVolVal').textContent = saved; }
+    } catch (e) {}
+  })();
+
+  // 通过对话+设备播报调用服务（复用已验证可发声的链路）
+  async function xhServiceCall(kind) {
+    const prompts = {
+      weather: ['哪个城市？', '上海'],
+      news: ['想看哪类新闻？', '国内'],
+      search: ['要搜什么？', '']
+    };
+    const [tip, def] = prompts[kind] || ['', ''];
+    const arg = (prompt(tip, def) || '').trim();
+    if (kind !== 'news' && kind === 'search' && !arg) { add('✗ 请输入搜索内容', 'sys err'); return; }
+    const q = kind === 'weather' ? (arg + '今天天气怎么样')
+            : kind === 'news' ? ('今天有什么' + (arg || '') + '新闻')
+            : ('帮我搜一下' + arg);
+    await xhAskAndSpeak(q);
+  }
+
+  async function xhMcpCall() {
+    const el = document.getElementById('xhMcpName');
+    const name = (el.value || '').trim();
+    if (!name) { add('✗ 先填工具名', 'sys err'); return; }
+    const raw = prompt('参数 JSON（可留空）', '{}');
+    if (raw === null) return;
+    let args = {};
+    try { args = raw.trim() ? JSON.parse(raw) : {}; } catch (e) { add('✗ 参数不是合法 JSON', 'sys err'); return; }
+    add('▸ 调用 ' + name, 'sys');
+    try {
+      const r = await fetch('/api/mcp/tools/' + encodeURIComponent(name) + '/test', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({arguments: args})
+      });
+      const d = await r.json().catch(() => ({raw: '非 JSON'}));
+      const txt = JSON.stringify(d).slice(0, 300);
+      add((r.ok ? '✓ ' : '✗ ') + name + ' → ' + r.status + ' ' + txt, r.ok ? 'sys ok' : 'sys err');
+    } catch (e) { add('✗ 调用失败：' + e.message, 'sys err'); }
+  }
+
+  // 统一：问一句 → 显示 → 设备念
+  async function xhAskAndSpeak(q) {
+    add(q, 'me');
+    const thinking = add('小慧正在查…', 'sys');
+    try {
+      const r = await fetch('/api/agents/' + agentId + '/chat', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text: q, session_id: 'chat-page'})
+      });
+      const d = await r.json();
+      thinking.remove();
+      const reply = d.reply || d.content || '(没有回复)';
+      add(reply, 'bot');
+      const clean = reply.replace(/\s*——\s*[^\s]+?:latest\s*$/i, '')
+                         .replace(/\s*——\s*[^\s]+?\s*$/i, '').trim();
+      const sr = await fetch('/api/console/speak', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text: clean.slice(0, 200)})
+      });
+      const sd = await sr.json();
+      if (sd && sd.ok) add('♪ 设备已发声（' + (sd.packets || 0) + ' 帧）', 'sys ok');
+      else add('… 设备没响应：' + ((sd && sd.error) || ''), 'sys');
+    } catch (e) {
+      thinking.remove();
+      add('✗ 失败：' + e.message, 'sys err');
+    }
+  }
+
+  window.xhServiceCall = xhServiceCall;
+  window.xhMcpCall = xhMcpCall;
+  window.xhAskAndSpeak = xhAskAndSpeak;
+
+
+  // 页面打开时若设备离线，主动催一次连接（不用等用户操作）
+  (async function autoConnectIfOffline() {
+    try {
+      const d = await (await fetch('/api/console/status')).json();
+      const ready = (d.devices || []).filter(x => x.mcp_ready);
+      if (!ready.length) {
+        fetch('/api/device/push', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({action: 'connect'})
+        }).catch(() => {});
+      }
+    } catch (e) {}
+  })();
+
+  // 搜索并列出结果（点歌名即播放）
+  async function xhMusicSearch() {
+    const q = (document.getElementById('xhSongQ').value || '').trim();
+    if (!q) { add('✗ 先输入歌名', 'sys err'); return; }
+    const box = document.getElementById('xhSongList');
+    box.innerHTML = '<div class="hint">搜索中…</div>';
+    try {
+      const r = await fetch('/api/music/search?q=' + encodeURIComponent(q) + '&limit=5');
+      const d = await r.json();
+      const songs = d.songs || [];
+      if (!songs.length) { box.innerHTML = '<div class="hint">没找到，换个关键词试试</div>'; return; }
+      box.innerHTML = songs.map(function (s, i) {
+        const name = (s.title || '').replace(/</g, '&lt;');
+        const artist = (s.artist || '').replace(/</g, '&lt;');
+        return '<div style="display:flex;align-items:center;gap:6px;padding:5px 0;border-bottom:1px solid #eaf1fa">' +
+          '<span style="flex:1;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+          name + ' <span class="hint" style="font-size:11.5px">' + artist + '</span></span>' +
+          '<button type="button" style="font-size:11.5px;padding:3px 9px" onclick="xhPlaySong(' + i + ')">播放</button>' +
+          '</div>';
+      }).join('');
+      window.__xhSongs = songs;
+    } catch (e) {
+      box.innerHTML = '<div class="hint">搜索失败：' + e.message + '</div>';
+    }
+  }
+
+  async function xhPlaySong(idx) {
+    const s = (window.__xhSongs || [])[idx];
+    if (!s) return;
+    add('▸ 播放：' + (s.title || ''), 'sys');
+    try {
+      const r = await fetch('/api/music/play_url', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({url: s.preview_url, title: s.title || '', artist: s.artist || ''})
+      });
+      const d = await r.json();
+      if (d && d.ok) add('♪ 已开始播放', 'sys ok');
+      else add('✗ ' + ((d && d.error) || '播放失败'), 'sys err');
+    } catch (e) { add('✗ 播放失败：' + e.message, 'sys err'); }
+  }
+
+  async function xhMusicStop() {
+    try {
+      const r = await fetch('/api/music/stop', {method: 'POST'});
+      const d = await r.json();
+      add(d && d.ok ? '▸ 已暂停播放' : '✗ 暂停失败', d && d.ok ? 'sys ok' : 'sys err');
+    } catch (e) { add('✗ 暂停失败', 'sys err'); }
+  }
+
+  window.xhMusicSearch = xhMusicSearch;
+  window.xhPlaySong = xhPlaySong;
+  window.xhMusicStop = xhMusicStop;
+
+
+  // ---------------------------------------------------- 默认动作自定义
+  window.__xhOverrides = {};   // key -> angles
+  window.__xhTune = null;      // 当前正在调整的动作 key
+
+// 与固件 servo_controller.cc 一致的默认角度
+  const XH_ACTION_ANGLES = {
+    stand: [90, 90, 90, 90, 90, 90],
+    sit:   [145, 145, 35, 35, 90, 90],
+    lie:   [158, 158, 22, 22, 90, 60],
+    walk:  [90, 90, 90, 90, 90, 90],
+    back:  [90, 90, 90, 90, 90, 90],
+    left:  [60, 60, 120, 120, 90, 90],
+    right: [120, 120, 60, 60, 90, 90],
+    dance: [70, 70, 110, 110, 90, 60],
+    sleep: [50, 50, 121, 121, 90, 60],
+    wake:  [90, 90, 90, 90, 90, 90],
+    wag:   [90, 90, 90, 90, 90, 60],
+    shake: [90, 90, 90, 90, 65, 90]
+  };
+
+  const XH_ACTION_LABELS = {
+    walk: '前进', back: '后退', left: '左转', right: '右转',
+    sit: '坐下', lie: '趴下', stand: '站立', dance: '跳舞',
+    wag: '摇尾巴', shake: '摇头', sleep: '睡觉', wake: '起身',
+    handshake: '握手', happy: '开心', stretch: '伸懒腰', spin: '转个圈'
+  };
+
+  // 动作面板目录：由 /api/console/actions 提供（语音服务汇总固件预设 + 服务端手势）
+  var XH_ACTIONS = [];
+  var XH_KINDS = {};
+
+  const XH_ACTION_FALLBACK = [
+    {action:'stand',label:'站立',kind:'preset'}, {action:'sit',label:'坐下',kind:'preset'},
+    {action:'lie',label:'趴下',kind:'preset'}, {action:'sleep',label:'睡觉',kind:'preset'},
+    {action:'wake',label:'起身',kind:'preset'}, {action:'walk',label:'前进',kind:'preset'},
+    {action:'back',label:'后退',kind:'preset'}, {action:'left',label:'左转',kind:'preset'},
+    {action:'right',label:'右转',kind:'preset'}, {action:'dance',label:'跳舞',kind:'preset'},
+    {action:'wag',label:'摇尾巴',kind:'preset'}, {action:'shake',label:'摇头',kind:'preset'},
+    {action:'handshake',label:'握手',kind:'gesture'}, {action:'happy',label:'开心',kind:'gesture'},
+    {action:'stretch',label:'伸懒腰',kind:'gesture'}, {action:'spin',label:'转个圈',kind:'gesture'}
+  ];
+
+  async function xhLoadCatalog() {
+    try {
+      const d = await (await fetch('/api/console/actions')).json();
+      XH_ACTIONS = (d.actions && d.actions.length) ? d.actions : XH_ACTION_FALLBACK;
+    } catch (e) {
+      XH_ACTIONS = XH_ACTION_FALLBACK;
+    }
+    XH_ACTIONS.forEach(function (a) {
+      XH_KINDS[a.action] = a.kind || 'preset';
+      if (a.label) XH_ACTION_LABELS[a.action] = a.label;
+    });
+    xhRenderActGrid();
+  }
+
+  function xhRenderActGrid() {
+    const grid = document.getElementById('actGrid');
+    if (!grid) return;
+    const preset = XH_ACTIONS.filter(function (a) { return (a.kind || 'preset') !== 'gesture'; });
+    const gesture = XH_ACTIONS.filter(function (a) { return a.kind === 'gesture'; });
+    const html = [];
+    preset.forEach(function (a) {
+      html.push('<button data-a="' + a.action + '">' + (a.label || a.action) + '</button>');
+    });
+    if (gesture.length) {
+      html.push('<div style="grid-column:1/-1;margin:8px 0 2px;font-size:12px;color:#7b93ad">手势（服务端逐帧编排，无需烧录）</div>');
+      gesture.forEach(function (a) {
+        html.push('<button data-a="' + a.action + '" data-gesture="1" style="border-style:dashed">'
+          + (a.label || a.action) + '</button>');
+      });
+    }
+    grid.innerHTML = html.join('');
+  }
+
+  async function xhLoadOverrides() {
+    try {
+      const d = await (await fetch('/api/actions')).json();
+      const map = {};
+      (d.actions || []).forEach(function (a) {
+        if (XH_ACTION_LABELS[a.name]) map[a.name] = a.angles;
+      });
+      window.__xhOverrides = map;
+      // 标记哪些已自定义
+      document.querySelectorAll('.acts button[data-a]').forEach(function (b) {
+        const key = b.dataset.a;
+        const base = XH_ACTION_LABELS[key] || key;
+        b.textContent = map[key] ? base + ' *' : base;
+      });
+    } catch (e) {}
+  }
+
+  function xhTuneAction(key) {
+    window.__xhTune = key;
+    const bar = document.getElementById('xhTuneBar');
+    const nm = document.getElementById('xhTuneName');
+    if (nm) nm.textContent = XH_ACTION_LABELS[key] || key;
+    if (bar) bar.style.display = 'block';
+
+    // 把该动作当前角度显示到舵机微调滑块上（已自定义优先，其次固件默认）
+    const src = window.__xhOverrides[key] || (XH_ACTION_ANGLES[key] || []).join(',');
+    if (src) {
+      const arr = String(src).split(',').map(function (x) { return parseInt(x) || 90; });
+      for (let i = 0; i < 4 && i < arr.length; i++) {
+        xhAngles[i] = arr[i];
+      }
+      xhRenderServos();          // 重绘滑块，角度立即显示出来
+      fetch('/api/device/pose', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({angles: xhAngles.join(',')})
+      }).catch(function () {});
+      add('▸ 「' + (XH_ACTION_LABELS[key] || key) + '」当前角度：' + arr.join(', '), 'sys');
+    }
+    add('▸ 调整「' + (XH_ACTION_LABELS[key] || key) + '」：拖滑块 → 保存', 'sys');
+    const box = document.getElementById('xhTuneBar');
+    if (box && box.scrollIntoView) box.scrollIntoView({behavior: 'smooth', block: 'center'});
+  }
+
+  function xhTuneCancel() {
+    window.__xhTune = null;
+    const bar = document.getElementById('xhTuneBar');
+    if (bar) bar.style.display = 'none';
+  }
+
+  async function xhTuneSave() {
+    const key = window.__xhTune;
+    if (!key) return;
+    const angles = xhAngles.join(',');
+    try {
+      const list = (await (await fetch('/api/actions')).json()).actions || [];
+      const exist = list.find(function (a) { return a.name === key; });
+      if (exist) await fetch('/api/actions/' + exist.id, {method: 'DELETE'});
+      const r = await fetch('/api/actions', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: key, angles: angles})
+      });
+      const d = await r.json();
+      if (d.ok || d.id) {
+        add('✓ 已保存「' + (XH_ACTION_LABELS[key] || key) + '」：' + angles, 'sys ok');
+        xhTuneCancel();
+        xhLoadOverrides();
+      } else {
+        add('✗ 保存失败：' + (d.error || d.detail || ''), 'sys err');
+      }
+    } catch (e) { add('✗ 保存失败：' + e.message, 'sys err'); }
+  }
+
+  // 覆盖点击行为：手势走语音服务手势引擎；预设有自定义角度就发角度，否则发预置动作
+  function xhBindActions() {
+    document.querySelectorAll('.acts button[data-a]').forEach(function (b) {
+      b.onclick = async function () {
+        const key = b.dataset.a;
+        const isGesture = b.dataset.gesture === '1' || XH_KINDS[key] === 'gesture';
+        const label = XH_ACTION_LABELS[key] || key;
+        const angles = isGesture ? null : window.__xhOverrides[key];
+        b.disabled = true;
+        add('▸ 指令：' + label + (angles ? '（自定义）' : ''), 'sys');
+        try {
+          let d = {};
+          if (angles) {
+            const r = await fetch('/api/device/pose', {
+              method: 'POST', headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({angles: angles})
+            });
+            d = await r.json();
+            d = {ok: d.ok, tip: '已按自定义角度执行'};
+          } else {
+            const r = await fetch('/api/console/action', {
+              method: 'POST', headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({action: key})
+            });
+            try { d = await r.json(); } catch (e) {}
+            if (d && d.ok) {
+              d.tip = label + (d.frames ? '　（' + d.frames + ' 帧）' : '') +
+                (d.latency_ms != null ? '　' + d.latency_ms + 'ms' : '');
+            }
+          }
+          add(d.ok ? ('✓ ' + (d.tip || label)) : ('✗ ' + (d.error || d.detail || '失败')),
+              d.ok ? 'sys ok' : 'sys err');
+        } catch (e) { add('✗ 网络错误：' + e.message, 'sys err'); }
+        finally { b.disabled = false; }
+      };
+      // 长按 / 右键进入角度调整（手势没有可调角度，跳过）
+      b.oncontextmenu = function (ev) {
+        if (b.dataset.gesture === '1') return;
+        ev.preventDefault();
+        xhTuneAction(b.dataset.a);
+      };
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', async function () {
+    await xhLoadCatalog();   // 先渲染按钮（含新增动作与手势），再绑事件
+    xhBindActions();
+    xhLoadOverrides();
+  });
+
+
+  // 去掉模型标签，判断是否为真内容；空内容不渲染气泡
+  function xhCleanText(s) {
+    return String(s || '').replace(/——\s*[\w.\-:]+/g, '').trim();
+  }
+
+
+// ---------------- 动作编排 ----------------
+var seqSteps = [];
+
+function seqCurrentAngles() {
+  var v = [];
+  for (var i = 0; i < 4; i++) {
+    var el = document.getElementById('xhr' + i);
+    v.push(el ? el.value : '90');
+  }
+  return v.join(',');
+}
+
+function seqRender() {
+  var box = document.getElementById('seqSteps');
+  if (!seqSteps.length) { box.textContent = '还没有步骤'; return; }
+  box.innerHTML = seqSteps.map(function (s, i) {
+    return '<div style="display:flex;justify-content:space-between;padding:2px 0">'
+      + '<span>步骤' + (i + 1) + '：' + s.angles + ' <b>' + s.ms + 'ms</b></span>'
+      + '<a href="javascript:seqDel(' + i + ')" style="color:#c0392b">删除</a></div>';
+  }).join('');
+}
+
+function seqAddStep() {
+  var ms = prompt('这一步持续多少毫秒？（100~1000）', '250');
+  if (ms === null) return;
+  ms = parseInt(ms, 10);
+  if (isNaN(ms) || ms < 50) ms = 250;
+  seqSteps.push({ angles: seqCurrentAngles(), ms: Math.min(ms, 3000) });
+  seqRender();
+}
+
+function seqDel(i) { seqSteps.splice(i, 1); seqRender(); }
+
+async function seqPlay() {
+  var name = document.getElementById('seqName').value.trim();
+  var steps = seqSteps;
+  if (!steps.length) { alert('先添加步骤'); return; }
+  if (name) { await seqSave(true); }
+  var target = name || '';
+  if (!target) { alert('先填动作名再试播'); return; }
+  var r = await fetch('/api/actions/sequences/play', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: target })
+  });
+  var d = await r.json();
+  if (!d.ok) alert(d.error || '播放失败');
+}
+
+async function seqSave(silent) {
+  var name = document.getElementById('seqName').value.trim();
+  var loops = parseInt(document.getElementById('seqLoops').value, 10) || 1;
+  if (!name) { alert('请输入动作名'); return; }
+  if (!seqSteps.length) { alert('先添加步骤'); return; }
+  var r = await fetch('/api/actions/sequences', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name, steps: seqSteps, loops: loops })
+  });
+  var d = await r.json();
+  if (!d.ok) { alert(d.error || '保存失败'); return; }
+  if (!silent) alert('已保存：' + name);
+  seqLoadList();
+}
+
+async function seqLoadList() {
+  try {
+    var r = await fetch('/api/actions/sequences');
+    var d = await r.json();
+    var seqs = d.sequences || {};
+    var names = Object.keys(seqs);
+    var box = document.getElementById('seqList');
+    if (!names.length) { box.innerHTML = '<span style="color:#889">还没有保存的动作</span>'; return; }
+    box.innerHTML = names.map(function (n) {
+      var s = seqs[n];
+      return '<div style="display:flex;justify-content:space-between;padding:3px 0;border-top:1px dashed #dbeafe">'
+        + '<span>' + n + '（' + s.steps.length + ' 步 × ' + (s.loops || 1) + '）</span>'
+        + '<span><a href="javascript:seqPlayName(\'' + n + '\')">播放</a> · '
+        + '<a href="javascript:seqDelName(\'' + n + '\')" style="color:#c0392b">删除</a></span></div>';
+    }).join('');
+  } catch (e) { /* ignore */ }
+}
+
+async function seqPlayName(name) {
+  var r = await fetch('/api/actions/sequences/play', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name })
+  });
+  var d = await r.json();
+  if (!d.ok) alert(d.error || '播放失败');
+}
+
+async function seqDelName(name) {
+  if (!confirm('删除动作「' + name + '」？')) return;
+  await fetch('/api/actions/sequences/' + encodeURIComponent(name), { method: 'DELETE' });
+  seqLoadList();
+}
+
+setTimeout(seqLoadList, 600);
+
+</script>
+</body>
+</html>

@@ -1,0 +1,62 @@
+/* 训练数据中心样式（亮/深色均适配） */
+.tc-wrap{display:flex;flex-direction:column;gap:14px}
+.tc-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.tc-head .tc-path{font-size:12px;color:var(--xh-text-2,#7b93ad);font-family:Consolas,monospace}
+.tc-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
+.tc-tile{background:#fff;border:1px solid #dbe7f5;border-radius:12px;padding:12px 14px}
+.tc-tile .k{font-size:12px;color:#7b93ad}
+.tc-tile .v{font-size:22px;font-weight:700;color:#1b6fc4;line-height:1.3}
+.tc-toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.tc-toolbar input,.tc-toolbar select{
+  border:1px solid #dbe7f5;border-radius:9px;padding:7px 11px;font-size:13px;
+  font-family:inherit;background:#fbfdff;color:inherit;outline:none}
+.tc-toolbar input{min-width:200px;flex:1}
+.tc-table{width:100%;border-collapse:collapse;font-size:13px}
+.tc-table th{text-align:left;padding:9px 10px;background:#f4f8fd;color:#5b7590;
+  font-weight:600;border-bottom:1px solid #dbe7f5;white-space:nowrap}
+.tc-table td{padding:9px 10px;border-bottom:1px solid #eaf1fa;vertical-align:top}
+.tc-table tr:hover td{background:#f8fcff}
+.tc-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11.5px;
+  background:#eaf3ff;color:#1b6fc4;border:1px solid #cfe2fb}
+.tc-badge.warn{background:#fff4e5;color:#b26a00;border-color:#ffd9a8}
+.tc-badge.ok{background:#e8f7ef;color:#1e8e5a;border-color:#bfe8d2}
+.tc-empty{padding:34px 16px;text-align:center;color:#7b93ad;font-size:13.5px;
+  border:1.5px dashed #dbe7f5;border-radius:12px;background:#fbfdff}
+.tc-empty code{background:#eef4fb;padding:2px 6px;border-radius:5px;font-size:12px}
+
+/* 深色 */
+html[data-xh-theme="dark"] .tc-tile{background:#16223a;border-color:#24354d}
+html[data-xh-theme="dark"] .tc-tile .k{color:#7b93ad}
+html[data-xh-theme="dark"] .tc-tile .v{color:#7cc0ff}
+html[data-xh-theme="dark"] .tc-toolbar input,
+html[data-xh-theme="dark"] .tc-toolbar select{background:#0f1c2e;border-color:#27394f;color:#e6eef8}
+html[data-xh-theme="dark"] .tc-table th{background:#182742;color:#9fb4cc;border-bottom-color:#24354d}
+html[data-xh-theme="dark"] .tc-table td{background:#16223a;color:#dbe7f5;border-bottom-color:#1d2c44}
+html[data-xh-theme="dark"] .tc-table tr:hover td{background:#1d3049}
+html[data-xh-theme="dark"] .tc-badge{background:#1b2c44;color:#7cc0ff;border-color:#27394f}
+html[data-xh-theme="dark"] .tc-badge.ok{background:#16301f;color:#5fd39a;border-color:#23543a}
+html[data-xh-theme="dark"] .tc-badge.warn{background:#3a2a12;color:#ffc06a;border-color:#5c421c}
+html[data-xh-theme="dark"] .tc-empty{background:#132033;border-color:#2b3f5c;color:#8ba3ba}
+html[data-xh-theme="dark"] .tc-empty code{background:#1b2c44;color:#9fb4cc}
+
+/* 审核抽屉 */
+.tc-drawer{position:fixed;top:0;right:-520px;width:520px;max-width:92vw;height:100vh;
+  background:#fff;border-left:1px solid #dbe7f5;box-shadow:-8px 0 30px rgba(27,111,196,.12);
+  display:flex;flex-direction:column;transition:right .22s ease;z-index:9999}
+.tc-drawer.show{right:0}
+.tc-drawer-head{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid #eaf1fa}
+.tc-drawer-body{flex:1;overflow-y:auto;padding:14px 16px;font-size:13.5px;line-height:1.7}
+.tc-drawer-foot{padding:12px 16px;border-top:1px solid #eaf1fa;background:#fbfdff}
+.tc-drawer-foot textarea{width:100%;border:1px solid #dbe7f5;border-radius:9px;padding:8px 10px;
+  font-size:13px;font-family:inherit;resize:vertical;outline:none}
+.tc-msg{padding:9px 11px;border-radius:9px;background:#f6faff;margin-bottom:9px;white-space:pre-wrap}
+.tc-msg .who{font-size:11.5px;color:#7b93ad;margin-bottom:4px;text-transform:uppercase}
+.tc-meta{font-size:12px;color:#7b93ad;margin-bottom:12px}
+.ok-btn{background:#1e8e5a !important;color:#fff !important;border:0 !important;padding:8px 18px !important}
+.warn-btn{background:#c0392b !important;color:#fff !important;border:0 !important;padding:8px 18px !important}
+
+html[data-xh-theme="dark"] .tc-drawer{background:#101b2a;border-left-color:#24354d}
+html[data-xh-theme="dark"] .tc-drawer-foot{background:#0f1c2e;border-top-color:#24354d}
+html[data-xh-theme="dark"] .tc-drawer-foot textarea{background:#132033;border-color:#27394f;color:#e6eef8}
+html[data-xh-theme="dark"] .tc-msg{background:#16223a;color:#dbe7f5}
+html[data-xh-theme="dark"] .tc-drawer-head{border-bottom-color:#24354d}

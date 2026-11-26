@@ -1,0 +1,66 @@
+server:
+  ip: 0.0.0.0
+  port: 8000
+  http_port: 8003
+  # 设备 OTA 时下发的 websocket 地址（以控制台的 WS_URL 为准，这里仅作独立运行时的值）
+  websocket: ws://<你的服务器局域网IP>:8000/xiaozhi/v1/
+  timezone_offset: +8
+  close_connection_no_voice_time: 900
+  tts_timeout: 10
+  enable_wakeup_words_response_cache: true   # 保留此开关，问候改由 LLM 生成
+  enable_greeting: true
+
+selected_module:
+  VAD: SileroVAD
+  ASR: FunASR
+  LLM: LocalLLM
+  VLLM: LocalLLM
+  TTS: EdgeTTS
+  Memory: nomem
+  Intent: nointent
+
+# 接成员 A 的 qwen2.5:3b（OpenAI 兼容）
+LLM:
+  LocalLLM:
+    type: openai
+    model_name: qwen2.5:3b
+    base_url: http://<本地模型服务器IP>:8000/v1
+    api_key: ""
+    max_tokens: 120
+    temperature: 0.7
+    timeout: 900
+
+VAD:
+  SileroVAD:
+    type: silero
+    threshold: 0.25
+    model_dir: models/snakers4_silero-vad
+    # 实际生效值由控制台「语音设置 → 识别速度」覆盖（data/voice_settings.json）
+    min_silence_duration_ms: 350
+
+ASR:
+  FunASR:
+    type: fun_local
+    model_dir: models/SenseVoiceSmall
+    output_dir: tmp/
+
+TTS:
+  EdgeTTS:
+    type: edge
+    voice: zh-CN-XiaoxiaoNeural
+    output_dir: tmp/
+
+wakeup_words:
+  - "你好小慧"
+  - "你好小智"
+  - "嘿你好呀"
+  - "小爱同学"
+  - "你好小新"
+
+prompt: |
+  你是小慧，主人身边最亲近的伙伴。说话温柔自然，像熟人聊天一样，
+  不客套、不说「作为一个AI」这类话。回答简短，两三句说完。
+  这是在语音对话里，所以不要用列表、不要 markdown、不要括号补充说明。
+  开口第一句要短，控制在 12 个字以内，让人立刻听到回应，再补一句说明。
+  只有确实需要实时信息（天气、新闻、时间）时才查工具；其余问题直接回答，
+  不要为了确认而反问，也不要解释思考过程。

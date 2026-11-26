@@ -1,0 +1,11 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+httpx==0.28.1
+python-multipart==0.0.20
+
+# 音色列表与试听（微软 Edge TTS，免费，322 个音色 / 14 个中文）
+edge-tts==7.0.0
+
+# 唤醒词中文转拼音（下发设备用）
+pypinyin==0.53.0

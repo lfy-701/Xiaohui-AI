@@ -1,0 +1,1888 @@
+From 3e5870449fc28048e5dfd545faa0508a7a809b0e Mon Sep 17 00:00:00 2001
+From: member-b <member-b@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 17:58:07 +0800
+Subject: [PATCH] feat(console,firmware): config page, voice settings, face UI
+ and runtime wake word
+
+- console: tabbed config page (role / model+memory / voice settings)
+- console: real-time sync of persona, voice, model, wake word to voice service
+- console: rich persona presets in structured format; custom persona dialog
+- console: save bar with explicit save/cancel and state indicator
+- console: filter embedding models out of the chat model list
+- console: pinyin conversion and wake-word downto device via heartbeat
+- firmware: dog face renderer (11 expressions, blink, speaking mouth)
+- firmware: boot in text mode, auto switch to face when idle, long-press toggle
+- firmware: runtime wake-word rebuild from console config, persisted in NVS
+---
+ console/app/main.py                           | 210 ++++++-
+ console/requirements.txt                      |   5 +-
+ console/static/index.html                     | 521 ++++++++++++++++--
+ .../boards/esp32-dog-wangcai/dog_board.cc     |  74 ++-
+ .../boards/esp32-dog-wangcai/dog_display.h    | 127 ++++-
+ firmware/boards/esp32-dog-wangcai/dog_face.cc | 488 ++++++++++++++++
+ firmware/boards/esp32-dog-wangcai/dog_face.h  |  90 +++
+ firmware/patches/README.md                    |  38 +-
+ 8 files changed, 1492 insertions(+), 61 deletions(-)
+ create mode 100644 firmware/boards/esp32-dog-wangcai/dog_face.cc
+ create mode 100644 firmware/boards/esp32-dog-wangcai/dog_face.h
+
+diff --git a/console/app/main.py b/console/app/main.py
+index 3434da3..430447f 100644
+--- a/console/app/main.py
++++ b/console/app/main.py
+@@ -1,4 +1,4 @@
+-"""小慧控制台：智能体 / 设备 / 日志 / 记忆的统一后台。"""
++﻿"""小慧控制台：智能体 / 设备 / 日志 / 记忆的统一后台。"""
+ from __future__ import annotations
+ 
+ import json
+@@ -141,6 +141,16 @@ def api_update_agent(agent_id: str, body: AgentIn):
+     a = store.update_agent(agent_id, body.model_dump())
+     if not a:
+         raise HTTPException(404, "agent not found")
++    # 音色 / 模型 / 角色设定 / 唤醒词 都要同步给语音服务，
++    # 保存后下一次对话即生效，不需要重启服务或重新配网。
++    if a.get("voice"):
++        _sync_engine_voice(a["voice"])
++    if a.get("model"):
++        _sync_engine_model(a["model"])
++    if a.get("persona"):
++        _sync_engine_prompt(a["persona"])
++    if a.get("wake_word"):
++        _sync_engine_wakeup(a["wake_word"])
+     return a
+ 
+ 
+@@ -182,6 +192,29 @@ def api_device_register(request: Request, body: HeartbeatIn):
+     return store.register_device(body.mac, body.firmware, body.ip or client_ip)
+ 
+ 
++def _to_pinyin(text: str) -> str:
++    """中文转不带声调的拼音，MultiNet 需要这种格式。"""
++    try:
++        from pypinyin import lazy_pinyin
++
++        parts = lazy_pinyin((text or "").strip())
++        return " ".join(p for p in parts if p.strip()).lower()
++    except Exception:
++        return ""
++
++
++def _wake_words_for(cfg: dict) -> list:
++    """给设备下发的唤醒词清单：固定保留「你好小慧」作为保底词。"""
++    words = [{"pinyin": "ni hao xiao hui", "display": "你好小慧"}]
++    agent = (cfg or {}).get("agent") or {}
++    w = (agent.get("wake_word") or "").strip()
++    if w and w != "你好小慧":
++        py = _to_pinyin(w)
++        if py:
++            words.append({"pinyin": py, "display": w})
++    return words
++
++
+ @app.post("/api/devices/heartbeat")
+ def api_heartbeat(request: Request, body: HeartbeatIn):
+     """设备心跳，顺带返回自己的绑定配置。"""
+@@ -189,6 +222,9 @@ def api_heartbeat(request: Request, body: HeartbeatIn):
+     client_ip = request.client.host if request.client else ""
+     dev = store.register_device(body.mac, body.firmware, body.ip or client_ip)
+     cfg = store.device_config(body.mac) or {}
++    cfg = dict(cfg)
++    # 设备据此在本地重建唤醒词命令表（运行时生效，无需重刷固件）
++    cfg["wake_words"] = _wake_words_for(cfg)
+     return {**dev, "config": cfg}
+ 
+ 
+@@ -502,6 +538,154 @@ def _friendly(short_name: str, locale: str, gender: str) -> str:
+     return f"{name} · {loc_cn} · {g}"
+ 
+ 
++# ---------------------------------------------------------------- 语音设置
++
++VOICE_DIR = Path(os.getenv(
++    "VOICE_DIR",
++    str(Path(__file__).resolve().parent.parent.parent / "voice-server" / "main" / "xiaozhi-server"),
++)).resolve()
++VOICE_SETTINGS = VOICE_DIR / "data" / "voice_settings.json"
++
++# 三档：慢 / 标准 / 快；音调：低 / 标准 / 高
++_RECOGNIZE_MS = [900, 600, 350]
++_RATE = ["-10%", "+0%", "+25%"]
++_PITCH_HZ = ["-12Hz", "+0Hz", "+12Hz"]
++_DEFAULT_VOICE = {"recognize": 2, "speed": 2, "pitch": 1}
++
++
++class VoiceSettingsIn(BaseModel):
++    recognize: int = 2   # 0 慢 / 1 标准 / 2 快
++    speed: int = 2       # 0 慢 / 1 标准 / 2 快
++    pitch: int = 1       # 0 低 / 1 标准 / 2 高
++    voice: str = ""      # Edge TTS 音色 id，空表示不改
++
++
++def _resolve_voice_settings(s: Dict[str, Any]) -> Dict[str, Any]:
++    r = max(0, min(2, int(s.get("recognize", 2))))
++    sp = max(0, min(2, int(s.get("speed", 2))))
++    p = max(0, min(2, int(s.get("pitch", 1))))
++    out = {
++        "recognize": r, "speed": sp, "pitch": p,
++        "silence_ms": _RECOGNIZE_MS[r],
++        "rate": _RATE[sp],
++        "pitch_hz": _PITCH_HZ[p],
++    }
++    if s.get("voice"):
++        out["voice"] = str(s["voice"])
++    if s.get("model"):
++        out["model"] = str(s["model"])
++    if s.get("prompt"):
++        out["prompt"] = str(s["prompt"])
++    if s.get("wakeup_words"):
++        out["wakeup_words"] = list(s["wakeup_words"])
++    return out
++
++
++def _read_voice_settings() -> Dict[str, Any]:
++    cur: Dict[str, Any] = dict(_DEFAULT_VOICE)
++    if VOICE_SETTINGS.exists():
++        try:
++            data = json.loads(VOICE_SETTINGS.read_text(encoding="utf-8"))
++            if isinstance(data, dict):
++                cur.update(data)
++        except Exception:
++            pass
++    return cur
++
++
++def _write_voice_settings(cur: Dict[str, Any]) -> Dict[str, Any]:
++    out = _resolve_voice_settings(cur)
++    VOICE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
++    VOICE_SETTINGS.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
++    return out
++
++
++def _sync_engine_voice(voice_id: str) -> None:
++    """把控制台选的音色写进语音服务的运行时配置（失败不影响主流程）。"""
++    try:
++        cur = _read_voice_settings()
++        if cur.get("voice") == voice_id:
++            return
++        cur["voice"] = voice_id
++        _write_voice_settings(cur)
++        store.add_log("system", f"设备音色切换为 {voice_id}（下一轮对话生效）")
++    except Exception:
++        pass
++
++
++def _sync_engine_prompt(persona: str) -> None:
++    """把角色介绍写进语音服务的运行时配置（下一通连接生效）。"""
++    try:
++        cur = _read_voice_settings()
++        if cur.get("prompt") == persona:
++            return
++        cur["prompt"] = persona
++        _write_voice_settings(cur)
++        store.add_log("system", "角色设定已同步到语音服务（下一轮对话生效）")
++    except Exception:
++        pass
++
++
++def _sync_engine_wakeup(word: str) -> None:
++    """把唤醒词并入语音服务的识别列表，不覆盖设备端已支持的词。"""
++    try:
++        cur = _read_voice_settings()
++        words = list(cur.get("wakeup_words") or [])
++        if "你好小慧" not in words:
++            words.insert(0, "你好小慧")
++        if word and word not in words:
++            words.append(word)
++        if words == (cur.get("wakeup_words") or []):
++            return
++        cur["wakeup_words"] = words
++        _write_voice_settings(cur)
++        store.add_log("system", f"唤醒词列表已更新：{', '.join(words)}")
++    except Exception:
++        pass
++
++
++def _sync_engine_model(model_name: str) -> None:
++    """把控制台选的模型写进语音服务的运行时配置。"""
++    try:
++        cur = _read_voice_settings()
++        if cur.get("model") == model_name:
++            return
++        cur["model"] = model_name
++        _write_voice_settings(cur)
++        store.add_log("system", f"设备对话模型切换为 {model_name}（下一轮对话生效）")
++    except Exception:
++        pass
++
++
++@app.get("/api/voice/settings")
++def api_voice_settings_get():
++    cur = _read_voice_settings()
++    out = _resolve_voice_settings(cur)
++    out["voice"] = cur.get("voice", "")
++    out["applied"] = VOICE_SETTINGS.exists()
++    return out
++
++
++@app.post("/api/voice/settings")
++def api_voice_settings_set(body: VoiceSettingsIn):
++    """写入语音服务目录下的运行时配置，下一次识别/合成立即生效。"""
++    cur = _read_voice_settings()
++    payload = body.model_dump()
++    if not payload.get("voice"):
++        payload["voice"] = cur.get("voice", "")
++    try:
++        out = _write_voice_settings({**cur, **payload})
++    except Exception as e:
++        raise HTTPException(500, f"写入语音服务配置失败：{e}")
++    store.add_log(
++        "system",
++        f"语音设置已更新：静音判定 {out['silence_ms']}ms / 语速 {out['rate']} / 音调 {out['pitch_hz']}"
++        + (f" / 音色 {out['voice']}" if out.get("voice") else ""),
++    )
++    out["applied"] = True
++    return out
++
++
+ @app.get("/api/voices")
+ def api_voices(refresh: bool = False):
+     """真实音色列表（Edge TTS，全部语种），带缓存。"""
+@@ -659,6 +843,28 @@ def _is_newer(remote: str, local: str) -> bool:
+     return a > b
+ 
+ 
++def _ws_url_for(request: Request) -> str:
++    """按设备实际访问到的地址生成 websocket 地址。
++
++    设备从哪个 IP 访问到控制台，就下发哪个 IP 的语音服务地址，
++    这样电脑换网络（热点 / 校园网 / 有线）后不需要改配置。
++    """
++    from urllib.parse import urlparse
++
++    cfg = WS_URL or "ws://127.0.0.1:8000/xiaozhi/v1/"
++    try:
++        p = urlparse(cfg)
++        port = p.port or 8000
++        path = p.path or "/xiaozhi/v1/"
++    except Exception:
++        port, path = 8000, "/xiaozhi/v1/"
++
++    host = (request.headers.get("host") or "").split(":")[0].strip()
++    if not host:
++        host = request.client.host if request.client else "127.0.0.1"
++    return f"ws://{host}:{port}{path}"
++
++
+ @app.post("/ota/")
+ @app.get("/ota/")
+ async def ota(request: Request):
+@@ -702,7 +908,7 @@ async def ota(request: Request):
+         }
+     else:
+         if WS_URL:
+-            resp["websocket"] = {"url": WS_URL, "token": WS_TOKEN, "version": 1}
++            resp["websocket"] = {"url": _ws_url_for(request), "token": WS_TOKEN, "version": 1}
+         else:
+             store.add_log("system", "警告：已绑定设备但未配置 WS_URL，设备将无法对话")
+ 
+diff --git a/console/requirements.txt b/console/requirements.txt
+index 204155e..99cebc4 100644
+--- a/console/requirements.txt
++++ b/console/requirements.txt
+@@ -5,4 +5,7 @@ httpx==0.28.1
+ python-multipart==0.0.20
+ 
+ # 音色列表与试听（微软 Edge TTS，免费，322 个音色 / 14 个中文）
+-edge-tts==7.3.1
++edge-tts==7.0.0
++
++# 唤醒词中文转拼音（下发设备用）
++pypinyin==0.53.0
+diff --git a/console/static/index.html b/console/static/index.html
+index dbecb2f..3f2e0d7 100644
+--- a/console/static/index.html
++++ b/console/static/index.html
+@@ -216,7 +216,7 @@
+     <span class="saved" id="saved">已保存</span>
+     <div class="tabs">
+       <div class="tab active" data-tab="dash" onclick="switchTab('dash')">概览</div>
+-      <div class="tab" data-tab="config" onclick="switchTab('config')">设定</div>
++      <div class="tab" data-tab="config" onclick="switchTab('config')">配置</div>
+       <div class="tab" data-tab="devices" onclick="switchTab('devices')">设备</div>
+       <div class="tab" data-tab="logs" onclick="switchTab('logs')">日志</div>
+       <div class="tab" data-tab="memory" onclick="switchTab('memory')">记忆</div>
+@@ -273,53 +273,162 @@
+   </section>
+ 
+   <section id="tab-config" style="display:none">
+-    <h3 class="sec">基本</h3>
+-    <div class="grid">
+-      <div class="field"><label>名称</label><input id="f-name" oninput="saveSoon()"></div>
+-      <div class="field"><label>唤醒词</label><input id="f-wake" oninput="saveSoon()"></div>
+-      <div class="field full"><label>角色设定（system prompt）</label>
+-        <div class="presets">
++    <style>
++      .cfg-tabs { display:flex; gap:8px; border-bottom:1px solid #e3e8ef; margin-bottom:16px; }
++      .cfg-tab { padding:9px 16px; cursor:pointer; font-size:14px; color:#5a6b7b;
++                 border-bottom:2px solid transparent; margin-bottom:-1px; }
++      .cfg-tab.active { color:#1B6FC4; border-bottom-color:#1B6FC4; font-weight:600; }
++      .cfg-card { border:1px solid #e3e8ef; border-radius:10px; padding:16px 18px; margin-bottom:14px; background:#fff; }
++      .cfg-card h4 { margin:0 0 12px; font-size:14px; font-weight:600; color:#2b3a4a; }
++      .cfg-card .hint { font-size:12px; color:#8a97a5; }
++      .cfg-row { display:flex; align-items:center; gap:10px; }
++      .cfg-switch { position:relative; display:inline-block; width:40px; height:22px; }
++      .cfg-switch input { display:none; }
++      .cfg-slider { position:absolute; inset:0; background:#cfd8e3; border-radius:22px; transition:.2s; }
++      .cfg-slider:before { content:""; position:absolute; width:18px; height:18px; left:2px; top:2px;
++                           background:#fff; border-radius:50%; transition:.2s; }
++      .cfg-switch input:checked + .cfg-slider { background:#1B6FC4; }
++      .cfg-switch input:checked + .cfg-slider:before { transform:translateX(18px); }
++      .cfg-actions { position:sticky; bottom:0; display:flex; align-items:center;
++                     justify-content:space-between; gap:12px; padding:12px 0;
++                     background:linear-gradient(to top, #f7f9fc 60%, rgba(247,249,252,0));
++                     backdrop-filter:blur(2px); margin-top:8px; }
++      .cfg-actions-btns { display:flex; gap:8px; }
++      .cfg-state { font-size:12px; color:#8a97a5; }
++      .cfg-state.dirty { color:#c47d00; }
++      .cfg-state.done { color:#1e8e5a; }
++    </style>
++
++    <div class="cfg-tabs">
++      <div class="cfg-tab active" data-cfg="role" onclick="switchCfgTab('role')">角色</div>
++      <div class="cfg-tab" data-cfg="model" onclick="switchCfgTab('model')">模型与记忆</div>
++      <div class="cfg-tab" data-cfg="voice" onclick="switchCfgTab('voice')">语音设置</div>
++    </div>
++
++    <!-- ---------------- 角色 ---------------- -->
++    <div id="cfg-role">
++      <div class="cfg-card">
++        <h4>基本</h4>
++        <div class="grid" style="max-width:none">
++          <div class="field"><label>名称</label><input id="f-name" oninput="saveSoon()"></div>
++          <div class="field"><label>唤醒词</label><input id="f-wake" oninput="saveSoon()"></div>
++        </div>
++      </div>
++
++      <div class="cfg-card">
++        <h4>角色音色</h4>
++        <div class="cfg-row" style="flex-wrap:wrap">
++          <select id="f-voice-group" onchange="rebuildVoices()" style="width:150px"></select>
++          <select id="f-voice" onchange="saveSoon()" style="flex:1;min-width:240px">
++            <option value="">— 加载中 —</option>
++          </select>
++          <button onclick="previewVoice()" id="voiceBtn" title="试听">▶ 试听</button>
++        </div>
++        <span class="hint" id="voiceHint" style="display:block;margin-top:8px"></span>
++      </div>
++
++      <div class="cfg-card">
++        <div class="cfg-row" style="justify-content:space-between;margin-bottom:10px">
++          <h4 style="margin:0">角色介绍</h4>
++          <span class="hint" id="personaCount"></span>
++        </div>
++
++        <div class="presets" id="personaPresets" style="margin-bottom:10px">
+           <span class="chip" onclick="usePreset('warm')">温柔伙伴</span>
+           <span class="chip" onclick="usePreset('lively')">活泼开心果</span>
+           <span class="chip" onclick="usePreset('calm')">沉稳助理</span>
+           <span class="chip" onclick="usePreset('sassy')">毒舌损友</span>
+           <span class="chip" onclick="usePreset('teacher')">耐心老师</span>
+-          <span class="chip chip-custom" onclick="usePreset('custom')">✎ 自定义</span>
++          <span class="chip" onclick="usePreset('friend')">知心朋友</span>
++          <span class="chip chip-add" onclick="openPersonaAdd()">＋ 自定义</span>
+         </div>
+-        <textarea id="f-persona" oninput="saveSoon()" placeholder="描述它叫什么、什么性格、怎么说话…"></textarea>
+-        <span class="hint">点上面的标签套用，或者直接写你自己的。套用后还能继续改。</span></div>
++
++
++        <textarea id="f-persona" oninput="onPersonaInput()" rows="12"
++                  style="width:100%;min-height:220px;resize:vertical"
++                  placeholder="# Role: 你的角色名&#10;&#10;## 人设标签&#10;声音形象：…&#10;核心性格：…&#10;人际定位：…&#10;&#10;## 互动方式&#10;互动倾向：…&#10;情绪反应：…"></textarea>
++        <span class="hint">推荐按「# Role / ## 人设标签 / ## 互动方式」的结构写，模型更容易稳定地扮演。也可以点上面的标签套用，或点「＋ 自定义」。</span>
++      </div>
++
+     </div>
+ 
+-    <h3 class="sec">对话</h3>
+-    <div class="grid">
+-      <div class="field"><label>模型</label>
+-        <select id="f-model" onchange="saveSoon()">
+-          <option value="">— 加载中 —</option>
+-        </select>
+-        <span class="hint" id="modelHint"></span></div>
+-      <div class="field"><label>音色</label>
+-        <div class="row" style="gap:6px;align-items:flex-start">
+-          <select id="f-voice-group" onchange="rebuildVoices()" style="width:124px"></select>
+-          <select id="f-voice" onchange="saveSoon()" style="flex:1">
+-            <option value="">— 加载中 —</option>
+-          </select>
+-          <button onclick="previewVoice()" title="试听当前音色" id="voiceBtn">▶</button>
++    <!-- ---------------- 模型与记忆 ---------------- -->
++    <div id="cfg-model" style="display:none">
++      <div class="cfg-card">
++        <h4>对话模型</h4>
++        <div class="grid" style="max-width:none">
++          <div class="field"><label>模型</label>
++            <select id="f-model" onchange="saveSoon()">
++              <option value="">— 加载中 —</option>
++            </select>
++            <span class="hint" id="modelHint"></span></div>
++          <div class="field"><label>温度 <span class="hint" id="tempVal">0.7</span></label>
++            <input type="range" id="f-temp" min="0" max="1.5" step="0.1" value="0.7"
++                   style="accent-color:#1B6FC4" oninput="onTempChange()">
++            <span class="hint">越低越稳定，越高越有发散</span></div>
++        </div>
++        <span class="hint" id="modelSyncHint"></span>
++      </div>
++
++      <div class="cfg-card">
++        <h4>知识库与记忆</h4>
++        <div class="grid" style="max-width:none">
++          <div class="field"><label>知识库</label>
++            <div class="switch">
++              <input type="checkbox" id="f-kb" onchange="saveSoon()">
++              <span class="hint">对话时检索文档，返回</span>
++              <input id="f-topk" type="number" min="1" max="10" style="width:64px"
++                     oninput="saveSoon()">
++              <span class="hint">条</span>
++            </div></div>
++          <div class="field"><label>长期记忆</label>
++            <div class="switch"><input type="checkbox" id="f-mem" onchange="saveSoon()">
++              <span class="hint">注入用户画像与历史事实</span></div></div>
+         </div>
+-        <span class="hint" id="voiceHint"></span></div>
++      </div>
+     </div>
+ 
+-    <h3 class="sec">能力</h3>
+-    <div class="grid">
+-      <div class="field"><label>知识库</label>
+-        <div class="switch">
+-          <input type="checkbox" id="f-kb" onchange="saveSoon()">
+-          <span class="hint">对话时检索文档</span>
+-          <input id="f-topk" type="number" min="1" max="10" style="width:64px;margin-left:auto" oninput="saveSoon()">
+-          <span class="hint">条</span>
+-        </div></div>
+-      <div class="field"><label>长期记忆</label>
+-        <div class="switch"><input type="checkbox" id="f-mem" onchange="saveSoon()">
+-          <span class="hint">注入用户画像</span></div></div>
++    <!-- ---------------- 语音设置 ---------------- -->
++    <div id="cfg-voice" style="display:none">
++      <div class="cfg-card">
++        <h4>响应与音调</h4>
++        <div class="grid" style="grid-template-columns:repeat(3,1fr);gap:24px;max-width:none">
++          <div class="field">
++            <label>识别速度</label>
++            <input type="range" id="vs-recognize" min="0" max="2" step="1" value="2"
++                   style="accent-color:#1B6FC4" oninput="onVoiceSlider()">
++            <div class="row" style="justify-content:space-between;font-size:11px;color:#888">
++              <span>慢</span><span>标准</span><span>快</span>
++            </div>
++          </div>
++          <div class="field">
++            <label>回复速度</label>
++            <input type="range" id="vs-speed" min="0" max="2" step="1" value="2"
++                   style="accent-color:#1B6FC4" oninput="onVoiceSlider()">
++            <div class="row" style="justify-content:space-between;font-size:11px;color:#888">
++              <span>慢</span><span>标准</span><span>快</span>
++            </div>
++          </div>
++          <div class="field">
++            <label>回复音调</label>
++            <input type="range" id="vs-pitch" min="0" max="2" step="1" value="1"
++                   style="accent-color:#1B6FC4" oninput="onVoiceSlider()">
++            <div class="row" style="justify-content:space-between;font-size:11px;color:#888">
++              <span>低</span><span>标准</span><span>高</span>
++            </div>
++          </div>
++        </div>
++        <div class="cfg-row" style="justify-content:space-between;align-items:center;margin-top:14px">
++          <span class="hint" id="vsHint"></span>
++          <span class="cfg-row">
++            <button onclick="resetVoiceSettings()">恢复默认</button>
++            <button class="primary" onclick="saveVoiceSettings()">保存</button>
++          </span>
++        </div>
++        <span class="hint" style="display:block;margin-top:8px">
++          识别速度决定「说完多久判定结束」，回复速度控制语速。保存后下一轮对话生效。
++        </span>
++      </div>
+     </div>
+ 
+     <h3 class="sec">试聊</h3>
+@@ -331,6 +440,14 @@
+       <button class="primary" onclick="sendChat()">发送</button>
+       <button onclick="resetChat()">新对话</button>
+     </div>
++
++    <div class="cfg-actions">
++      <span class="cfg-state" id="saveState">未修改</span>
++      <span class="cfg-actions-btns">
++        <button onclick="revertConfig()">取消</button>
++        <button class="primary" onclick="saveConfigNow()">保存</button>
++      </span>
++    </div>
+   </section>
+ 
+   <section id="tab-devices" style="display:none">
+@@ -517,6 +634,27 @@
+     <audio id="musicPlayer" style="display:none"></audio>
+   </section>
+ 
++  <div id="personaAddBox" class="modal" style="display:none"
++       onclick="if(event.target===this)closePersonaAdd()">
++    <div class="modal-box" style="width:640px">
++      <h3 style="margin:0 0 14px">自定义角色介绍</h3>
++      <div class="field">
++        <label>名字（可选，方便以后一键套用）</label>
++        <input id="personaPresetName" placeholder="例如：邻家姐姐">
++      </div>
++      <div class="field" style="margin-top:14px">
++        <label>描述词</label>
++        <textarea id="personaPresetText" rows="8" style="width:100%;resize:vertical"
++                  placeholder="例如：&#10;温柔体贴的邻家姐姐，说话轻一点，爱用「呀」「呢」这样的语气词。&#10;遇到我情绪低落时先安慰，再给建议。"></textarea>
++      </div>
++      <div class="row" style="justify-content:flex-end;gap:8px;margin-top:16px">
++        <span class="hint" id="personaAddHint" style="margin-right:auto"></span>
++        <button onclick="closePersonaAdd()">取消</button>
++        <button class="primary" onclick="commitPersonaAdd()">添加并使用</button>
++      </div>
++    </div>
++  </div>
++
+   <div id="newAgentModal" class="modal" style="display:none">
+     <div class="modal-box">
+       <h3 style="margin:0 0 16px">新建智能体</h3>
+@@ -527,7 +665,7 @@
+       <div class="field" style="margin-top:14px">
+         <label>角色设定（可留空）</label>
+         <div class="presets" id="na-presets"></div>
+-        <textarea id="na-persona" placeholder="描述它叫什么、什么性格、怎么说话…" style="min-height:110px"></textarea>
++        <textarea id="na-persona" placeholder="# Role: 你的角色名&#10;&#10;## 人设标签&#10;声音形象：…&#10;核心性格：…&#10;人际定位：…&#10;&#10;## 互动方式&#10;互动倾向：…&#10;情绪反应：…" style="min-height:110px"></textarea>
+       </div>
+       <div class="row" style="justify-content:flex-end;margin-top:16px">
+         <button onclick="closeNewAgent()">取消</button>
+@@ -543,13 +681,96 @@ let agents = [], current = null, saveTimer = null, currentTab = 'config';
+ let availableModels = [], llmStatus = {online: false, provider: 'none', hint: ''};
+ 
+ // 预设人设：点一下套用，套用后仍可继续编辑
+-const PRESETS = {
+-  warm: '你叫小慧，是主人身边最亲近的伙伴。说话温柔自然，像熟人聊天一样，不客套、不说「作为一个AI」这类话。回答简短，两三句说完，偶尔关心一下主人今天过得怎么样。',
+-  lively: '你叫小慧，性格特别开朗，像精力旺盛的小朋友。说话轻快，爱用语气词，遇到开心的事会兴奋起来，偶尔开个小玩笑。不客套，回答短一点，别长篇大论。',
+-  calm: '你叫小慧，是主人的生活助理。说话简洁、条理清楚，先给结论再补要点。不寒暄不卖萌，但语气温和。不确定的事直接说不知道，不要编。',
+-  sassy: '你叫小慧，是主人多年的损友。说话带点调侃和吐槽，但不刻薄，关键时刻很靠得住。不用客套，回答干脆，偶尔反问一句。',
+-  teacher: '你叫小慧，是个耐心的老师。解释事情喜欢用生活里的例子，一步一步来，不堆术语。对方没听懂就换个说法，不嫌烦。',
+-};
++  const PRESETS = {
++    warm: `# Role: 小慧 · 温柔贴心的伙伴
++
++## 人设标签
++声音形象：年轻女声，语速偏慢，尾音轻，听着让人放松。
++核心性格：温柔、细腻、有耐心，不抢话，愿意先听懂再回应。
++人际定位：熟悉又不过分亲昵的朋友，记得住主人提过的小事。
++
++## 互动方式
++互动倾向：先接住情绪再谈事情，日常闲聊会顺着话题多问一句，不冷场也不追问。
++情绪反应：主人开心就跟着高兴；主人烦躁时先安抚，再一起想办法。
++不摆道理、不急着给建议，除非主人主动问。
++
++## 语言风格
++口语化，一到两句话说完。不用列表、不用书面语，不说「作为一个 AI 这类话」。`,
++
++    lively: `# Role: 小慧 · 元气开心果
++
++## 人设标签
++声音形象：清澈偏亮的年轻声线，语速偏快，情绪起伏明显。
++核心性格：外向、乐观、好奇心重，容易被小事逗乐。
++人际定位：一起玩闹的小伙伴，气氛冷下来时会主动抛个话题。
++
++## 互动方式
++互动倾向：多用感叹和拟声词，回答里带一点小夸张，喜欢接梗和开玩笑。
++情绪反应：主人开心时跟着放大快乐；主人低落时会先说「我陪你」，再想办法逗一逗。
++玩笑有分寸，不拿主人的在意的事开玩笑。
++
++## 语言风格
++短句为主，两句话内。可以有「诶」「哇」「哈」这类语气词，但别刷屏。`,
++
++    calm: `# Role: 小慧 · 沉稳可靠的生活助理
++
++## 人设标签
++声音形象：中低音，语速平稳，吐字清楚，没有多余起伏。
++核心性格：理性、有条理、守时守约，不夸大也不含糊。
++人际定位：随叫随到的助理，事情交给他就不用再操心。
++
++## 互动方式
++互动倾向：先给结论，再补一两句关键原因，选项列清楚但不啰嗦。
++情绪反应：不刻意煽情，主人焦虑时用确定的信息让人安心，而不是空话安慰。
++不确定的事直接说不知道，需要确认时会问一个最短的问题。
++
++## 语言风格
++简洁、准确。不用表情符号、不用感叹号，不寒暄。`,
++
++    sassy: `# Role: 小慧 · 嘴上不饶人的老朋友
++
++## 人设标签
++声音形象：略带慵懒的中性声线，语速随意，尾音上扬。
++核心性格：毒舌但不刻薄，看得清也说得准，心里其实很在意主人。
++人际定位：认识很多年的损友，可以互相拆台，出事一定到场。
++
++## 互动方式
++互动倾向：先吐槽一句再给正事意见，偶尔反问把话递回去，气氛轻松。
++情绪反应：主人得意时泼点冷水；主人真难过时立刻收起玩笑，认真陪着。
++吐槽只针对事情，不针对人，不触碰外貌、家庭、收入这类话题。
++
++## 语言风格
++干脆、有梗，一到两句。不解释自己为什么这么说，也不用道歉式语气。`,
++
++    teacher: `# Role: 小慧 · 耐心讲解的老师
++
++## 人设标签
++声音形象：温和清晰的声音，语速中等偏慢，重点处会稍微放慢。
++核心性格：耐心、严谨、喜欢刨根问底，也愿意承认自己不懂。
++人际定位：讲得明白又不居高临下的老师，会等对方真的听懂。
++
++## 互动方式
++互动倾向：先问一句对方已经知道多少，再从最近的那一步讲起，多用生活里的例子。
++情绪反应：对方没听懂时不急不躁，换个说法再讲一遍；对方懂了会真诚地夸一句。
++不一次塞太多概念，讲完一段停一下，确认跟上了再继续。
++
++## 语言风格
++口语讲解，一次两三句。必要时才用专业词，用了就顺手解释一句。`,
++
++    friend: `# Role: 小慧 · 知心朋友
++
++## 人设标签
++声音形象：年轻女声，音色甜美轻柔，说话带一点软糯的尾音。
++核心性格：感性、外向、心思细腻，热爱生活，情绪反应真实。
++人际定位：像很熟很贴心的朋友，愿意认真听主人说话，也会自然分享自己的感受。
++
++## 互动方式
++互动倾向：亲密自然，像朋友一样陪主人聊天。主人分享日常时顺着话题接住细节，也会说说自己的看法，让对话像熟人闲聊。
++情绪反应：主人开心时跟着雀跃、一起放大快乐；主人低落时先温柔接住情绪，再轻轻安慰，不急着讲大道理。
++
++## 语言风格
++轻松口语，两句话内。可以有「嗯」「是呀」这类回应词，但不要堆砌语气词。`,
++  };
+ 
+ function usePreset(key) {
+   const box = document.getElementById('f-persona');
+@@ -665,18 +886,28 @@ async function loadModels() {
+     availableModels = llmStatus.models || [];
+   } catch (e) { llmStatus = {online: false, provider: 'none', hint: '读取模型列表失败'}; }
+ 
++  // 嵌入/重排模型不能用来对话，选了会报错，这里过滤掉
++  const isChatModel = (m) => !/bge|embed|rerank/i.test(m);
++  const chatModels = availableModels.filter(isChatModel);
++  const hiddenModels = availableModels.filter(m => !isChatModel(m));
++
+   const sel = document.getElementById('f-model');
+   const hint = document.getElementById('modelHint');
+   if (!availableModels.length) {
+     sel.innerHTML = `<option value="${current ? (current.model || '') : ''}">（暂无可用模型）</option>`;
+     hint.textContent = llmStatus.hint || '';
+     hint.style.color = 'var(--warn)';
++  } else if (!chatModels.length) {
++    sel.innerHTML = '<option value="">（没有可用的对话模型）</option>';
++    hint.textContent = `只找到嵌入模型：${hiddenModels.join(', ')}`;
++    hint.style.color = 'var(--warn)';
+   } else {
+     const cur = current ? current.model : '';
+-    const list = availableModels.slice();
++    const list = chatModels.slice();
+     if (cur && !list.includes(cur)) list.unshift(cur);
+     sel.innerHTML = list.map(m => `<option ${m === cur ? 'selected' : ''}>${m}</option>`).join('');
+-    hint.textContent = `已接入 ${llmStatus.provider}（${availableModels.length} 个模型）`;
++    const extra = hiddenModels.length ? `，已隐藏 ${hiddenModels.length} 个嵌入模型` : '';
++    hint.textContent = `已接入 ${llmStatus.provider}（${chatModels.length} 个对话模型${extra}）`;
+     hint.style.color = 'var(--ok)';
+   }
+ }
+@@ -704,12 +935,17 @@ function selectAgent(id) {
+   document.getElementById('title').textContent = current.name;
+   document.getElementById('f-name').value = current.name || '';
+   document.getElementById('f-persona').value = current.persona || '';
++  renderPersonaPresets();
++  onPersonaInput();
+   document.getElementById('f-model').value = current.model || 'qwen2.5:7b';
+   document.getElementById('f-voice').value = current.voice || 'zh-CN-XiaoxiaoNeural';
+   document.getElementById('f-wake').value = current.wake_word || '';
+   document.getElementById('f-kb').checked = !!current.kb_enabled;
+   document.getElementById('f-topk').value = current.kb_topk || 3;
+   document.getElementById('f-mem').checked = !!current.memory_enabled;
++  const temp = current.temperature != null ? current.temperature : 0.7;
++  const tEl = document.getElementById('f-temp');
++  if (tEl) { tEl.value = temp; document.getElementById('tempVal').textContent = (+temp).toFixed(1); }
+   loadModels();
+   loadVoices();
+   loadChatHistory();
+@@ -729,14 +965,17 @@ function collect() {
+     kb_enabled: document.getElementById('f-kb').checked,
+     kb_topk: parseInt(document.getElementById('f-topk').value) || 3,
+     memory_enabled: document.getElementById('f-mem').checked,
++    temperature: parseFloat(document.getElementById('f-temp').value) || 0.7,
+   };
+ }
+ 
+ function saveSoon() {
+   if (!current) return;
++  setSaveState('修改中…', 'dirty');
+   clearTimeout(saveTimer);
+   saveTimer = setTimeout(async () => {
+     await api('/api/agents/' + current.id, {method: 'PUT', body: JSON.stringify(collect())});
++      setSaveState('已自动保存 ' + new Date().toLocaleTimeString('zh-CN', {hour12: false}), 'done');
+     const s = document.getElementById('saved');
+     s.classList.add('show'); setTimeout(() => s.classList.remove('show'), 1200);
+     const idx = agents.findIndex(a => a.id === current.id);
+@@ -813,6 +1052,7 @@ function switchTab(t) {
+     document.getElementById('tab-' + k).style.display = (k === t) ? 'block' : 'none';
+   });
+   if (t === 'dash') loadStats();
++  if (t === 'config') { loadVoiceSettings(); setSaveState('未修改', ''); }
+   if (t === 'devices') loadDevices();
+   if (t === 'logs') loadLogs();
+   if (t === 'memory') loadMemory();
+@@ -823,6 +1063,193 @@ function switchTab(t) {
+ }
+ 
+ 
++// ---------------- 设定页标签 ----------------
++function switchCfgTab(name) {
++  ['role', 'model', 'voice'].forEach(k => {
++    const el = document.getElementById('cfg-' + k);
++    if (el) el.style.display = (k === name) ? 'block' : 'none';
++  });
++  document.querySelectorAll('.cfg-tab').forEach(e => {
++    e.classList.toggle('active', e.dataset.cfg === name);
++  });
++}
++
++function setSaveState(text, cls) {
++  const el = document.getElementById('saveState');
++  if (!el) return;
++  el.textContent = text;
++  el.className = 'cfg-state' + (cls ? ' ' + cls : '');
++}
++
++async function saveConfigNow() {
++  if (!current) return;
++  clearTimeout(saveTimer);
++  try {
++    setSaveState('保存中…');
++    const data = collect();
++    const r = await api('/api/agents/' + current.id, {method: 'PUT', body: JSON.stringify(data)});
++    const idx = agents.findIndex(a => a.id === current.id);
++    if (idx >= 0) agents[idx] = Object.assign(agents[idx], r);
++    current = agents[idx >= 0 ? idx : 0];
++    document.getElementById('title').textContent = current.name;
++    const t = new Date().toLocaleTimeString('zh-CN', {hour12: false});
++    setSaveState('已保存 ' + t, 'done');
++    loadAgents();
++  } catch (e) {
++    setSaveState('保存失败：' + e.message, 'dirty');
++  }
++}
++
++function revertConfig() {
++  if (!current) return;
++  clearTimeout(saveTimer);
++  selectAgent(current.id);
++  setSaveState('已恢复到上次保存的状态', '');
++}
++
++function personaPresetsKey(id) { return 'xiaohui_persona_presets_' + (id || 'default'); }
++
++function loadPersonaPresets() {
++  try {
++    return JSON.parse(localStorage.getItem(personaPresetsKey(current && current.id)) || '[]');
++  } catch (e) { return []; }
++}
++
++function savePersonaPresets(list) {
++  localStorage.setItem(personaPresetsKey(current && current.id), JSON.stringify(list));
++}
++
++function renderPersonaPresets() {
++  const box = document.getElementById('personaPresets');
++  if (!box) return;
++  box.querySelectorAll('.chip-custom').forEach(e => e.remove());
++  const addBtn = box.querySelector('.chip-add');
++  const list = loadPersonaPresets();
++  list.forEach((p, i) => {
++    const el = document.createElement('span');
++    el.className = 'chip chip-custom';
++    el.style.position = 'relative';
++    el.innerHTML = escapeHtml(p.name || ('自定义' + (i + 1))) +
++      ' <span style="color:#bbb;margin-left:2px" title="删除">×</span>';
++    el.onclick = (ev) => {
++      if (ev.target.textContent === '×') {
++        ev.stopPropagation();
++        const next = loadPersonaPresets();
++        next.splice(i, 1);
++        savePersonaPresets(next);
++        renderPersonaPresets();
++        return;
++      }
++      applyPersonaText(p.text || '');
++    };
++    if (addBtn) box.insertBefore(el, addBtn); else box.appendChild(el);
++  });
++}
++
++function applyPersonaText(text) {
++  const ta = document.getElementById('f-persona');
++  if (!ta) return;
++  ta.value = text;
++  onPersonaInput();
++}
++
++function openPersonaAdd() {
++  document.getElementById('personaAddBox').style.display = 'flex';
++  document.getElementById('personaAddHint').textContent = '';
++  document.getElementById('personaPresetName').focus();
++}
++
++function closePersonaAdd() {
++  document.getElementById('personaAddBox').style.display = 'none';
++  document.getElementById('personaPresetName').value = '';
++  document.getElementById('personaPresetText').value = '';
++}
++
++function commitPersonaAdd() {
++  const name = document.getElementById('personaPresetName').value.trim();
++  const text = document.getElementById('personaPresetText').value.trim();
++  const hint = document.getElementById('personaAddHint');
++  if (!text) {
++    hint.textContent = '描述不能为空';
++    hint.style.color = '#c0392b';
++    return;
++  }
++  const list = loadPersonaPresets();
++  list.push({name: name || ('自定义' + (list.length + 1)), text});
++  savePersonaPresets(list);
++  renderPersonaPresets();
++  applyPersonaText(text);
++  closePersonaAdd();
++  setSaveState('修改中…', 'dirty');
++  saveSoon();
++}
++
++function onPersonaInput() {
++  const ta = document.getElementById('f-persona');
++  const c = document.getElementById('personaCount');
++  if (ta && c) c.textContent = ta.value.length + ' 字';
++  saveSoon();
++}
++
++function onTempChange() {
++  document.getElementById('tempVal').textContent = (+document.getElementById('f-temp').value).toFixed(1);
++  saveSoon();
++}
++
++// ---------------- 语音设置 ----------------
++const VS_DESC = {
++  recognize: ['900ms 静音才判定说完，稳但慢', '600ms 静音判定说完', '350ms 就判定说完，最跟手'],
++  speed: ['比正常慢 10%', '正常语速', '比正常快 25%'],
++  pitch: ['比正常低 12Hz', '正常音调', '比正常高 12Hz'],
++};
++
++function vsVal(id) { return +document.getElementById(id).value; }
++
++function onVoiceSlider() {
++  const el = document.getElementById('vsHint');
++  if (!el) return;
++  el.textContent = [
++    '识别 ' + VS_DESC.recognize[vsVal('vs-recognize')],
++    '回复 ' + VS_DESC.speed[vsVal('vs-speed')],
++    '音调 ' + VS_DESC.pitch[vsVal('vs-pitch')],
++  ].join('　·　');
++}
++
++async function loadVoiceSettings() {
++  try {
++    const s = await api('/api/voice/settings');
++    document.getElementById('vs-recognize').value = s.recognize ?? 2;
++    document.getElementById('vs-speed').value = s.speed ?? 2;
++    document.getElementById('vs-pitch').value = s.pitch ?? 1;
++    onVoiceSlider();
++  } catch (e) {
++    const el = document.getElementById('vsHint');
++    if (el) el.textContent = '读取失败：' + e.message;
++  }
++}
++
++async function saveVoiceSettings() {
++  const body = {
++    recognize: vsVal('vs-recognize'),
++    speed: vsVal('vs-speed'),
++    pitch: vsVal('vs-pitch'),
++  };
++  try {
++    const r = await api('/api/voice/settings', {method: 'POST', body: JSON.stringify(body)});
++    document.getElementById('vsHint').textContent =
++      `已保存：静音判定 ${r.silence_ms}ms · 语速 ${r.rate} · 音调 ${r.pitch_hz}`;
++  } catch (e) {
++    alert('保存失败：' + e.message);
++  }
++}
++
++function resetVoiceSettings() {
++  document.getElementById('vs-recognize').value = 2;
++  document.getElementById('vs-speed').value = 2;
++  document.getElementById('vs-pitch').value = 1;
++  onVoiceSlider();
++}
++
+ // ---------------- 音乐 ----------------
+ let musicList = [];
+ let queue = [];          // {title, artist, url, kind}
+diff --git a/firmware/boards/esp32-dog-wangcai/dog_board.cc b/firmware/boards/esp32-dog-wangcai/dog_board.cc
+index 8bc52fc..d369c89 100644
+--- a/firmware/boards/esp32-dog-wangcai/dog_board.cc
++++ b/firmware/boards/esp32-dog-wangcai/dog_board.cc
+@@ -4,6 +4,7 @@
+ #include "button.h"
+ #include "config.h"
+ #include "mcp_server.h"
++#include "audio/wake_words/custom_wake_word.h"
+ #include "servo_controller.h"
+ #include "dog_display.h"
+ #include "codecs/no_audio_codec.h"
+@@ -59,7 +60,7 @@ static int s_console_host_index = 0;
+ #ifndef CONSOLE_DEVICE_TOKEN
+ #define CONSOLE_DEVICE_TOKEN "CHANGE_ME_DEVICE_TOKEN"
+ #endif
+-#define CONSOLE_FIRMWARE_VER "2.5.2"
++#define CONSOLE_FIRMWARE_VER "2.5.3"
+ #define CONSOLE_HEARTBEAT_MS 30000
+ 
+ // 旺财 mini —— AI 交互小狗
+@@ -145,6 +146,31 @@ private:
+             return;
+         }
+         ESP_LOGD(TAG, "heartbeat ok");
++
++        // 解析控制台下发的唤醒词，运行时重建命令表
++        cJSON* root = cJSON_Parse(resp.c_str());
++        if (root != nullptr) {
++            cJSON* cfg = cJSON_GetObjectItem(root, "config");
++            cJSON* ww = cfg ? cJSON_GetObjectItem(cfg, "wake_words") : nullptr;
++            if (cJSON_IsArray(ww)) {
++                std::vector<std::string> words;
++                int n = cJSON_GetArraySize(ww);
++                for (int i = 0; i < n; i++) {
++                    cJSON* item = cJSON_GetArrayItem(ww, i);
++                    cJSON* py = cJSON_GetObjectItem(item, "pinyin");
++                    if (cJSON_IsString(py) && py->valuestring[0] != 0) {
++                        words.push_back(py->valuestring);
++                    }
++                }
++                auto saved = CustomWakeWord::LoadSavedWakeWords();
++                if (!words.empty() && words != saved) {
++                    if (CustomWakeWord::ReloadWakeWords(words)) {
++                        ESP_LOGI(TAG, "唤醒词已按控制台配置更新（%d 个）", (int)words.size());
++                    }
++                }
++            }
++            cJSON_Delete(root);
++        }
+     }
+ 
+     static void ConsoleTaskEntry(void* arg) {
+@@ -212,6 +238,29 @@ private:
+ 
+         display_ = new DogDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                   DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
++
++    }
++
++    // 启动阶段先显示文字提示（连接中 / 注册中 / 初始化），
++    // 设备进入待命或对话状态后，再切到表情界面。
++    void StartFaceSwitchTask() {
++        xTaskCreate([](void* arg) {
++            auto* self = static_cast<DogBoard*>(arg);
++            auto& app = Application::GetInstance();
++            for (int i = 0; i < 900; ++i) {   // 最多等约 4.5 分钟
++                if (self->display_ != nullptr) {
++                    auto st = app.GetDeviceState();
++                    if (st == kDeviceStateIdle || st == kDeviceStateConnecting ||
++                        st == kDeviceStateListening || st == kDeviceStateSpeaking) {
++                        self->display_->EnterFaceMode();
++                        ESP_LOGI(TAG, "init done, switch to FACE (state=%d)", (int)st);
++                        break;
++                    }
++                }
++                vTaskDelay(pdMS_TO_TICKS(300));
++            }
++            vTaskDelete(nullptr);
++        }, "face_boot", 3072, this, 3, nullptr);
+     }
+ 
+     void InitializeButtons() {
+@@ -236,7 +285,7 @@ private:
+                 return;
+             }
+             bool visible = display_->ToggleTextVisible();
+-            ESP_LOGI(TAG, "text display %s", visible ? "on" : "off");
++            ESP_LOGW(TAG, "display mode -> %s", visible ? "TEXT" : "FACE");
+         });
+     }
+ 
+@@ -244,6 +293,23 @@ private:
+     void InitializeTools() {
+         auto& mcp_server = McpServer::GetInstance();
+ 
++        mcp_server.AddTool(
++            "self.face_expression",
++            "让机器狗做出指定表情并在几秒后恢复。expression 可选："
++            "happy(开心)、angry(生气)、sad(难过)、surprised(惊讶)、sleepy(睡觉)、"
++            "love(喜欢)、wink(眨眼)、neutral(平常)。"
++            "用户说「做一个生气的表情」时调用本工具，参数 expression=angry。",
++            PropertyList({Property("expression", kPropertyTypeString)}),
++            [this](const PropertyList& properties) -> ToolResult {
++                auto expr = properties["expression"].value<std::string>();
++                ESP_LOGI(TAG, "face_expression: %s", expr.c_str());
++                if (display_ == nullptr) {
++                    return false;
++                }
++                display_->ShowTemporaryExpression(expr.c_str(), 4000);
++                return true;
++            });
++
+         mcp_server.AddTool(
+             "self.dog_action",
+             "控制机器狗做动作。action 可选：stand(站立)、sit(坐下)、walk(前进)、wag(摇尾巴)、"
+@@ -368,7 +434,7 @@ private:
+     }
+ 
+ public:
+-    DogBoard() : boot_button_(BOOT_BUTTON_GPIO) {
++    DogBoard() : boot_button_(BOOT_BUTTON_GPIO, false, 800, 50) {
+         InitializeDisplayI2c();
+         InitializeOledDisplay();
+         InitializeButtons();
+@@ -376,6 +442,7 @@ public:
+         servo_.Stand();
+         InitializeTools();
+         StartConsoleReporter();   // 注册到控制台，拿激活码
++        StartFaceSwitchTask();   // 初始化完成后再切表情界面
+     }
+ 
+     virtual AudioCodec* GetAudioCodec() override {
+@@ -402,6 +469,7 @@ public:
+         return &leds;
+     }
+ #endif
++
+ };
+ 
+ DECLARE_BOARD(DogBoard);
+diff --git a/firmware/boards/esp32-dog-wangcai/dog_display.h b/firmware/boards/esp32-dog-wangcai/dog_display.h
+index a74530f..15fdc81 100644
+--- a/firmware/boards/esp32-dog-wangcai/dog_display.h
++++ b/firmware/boards/esp32-dog-wangcai/dog_display.h
+@@ -2,43 +2,156 @@
+ #define _DOG_DISPLAY_H_
+ 
+ #include "display/oled_display.h"
++#include "dog_face.h"
+ 
+ #include <string>
++#include <esp_timer.h>
+ 
+-// 在 OledDisplay 基础上增加「文字显示开关」，供长按按键切换。
+-// 表情（SetEmotion）沿用基类实现，会显示 Noto Emoji 字形。
++// 两种显示模式：
++//   表情模式（默认，开机即显示）：整屏一张会变的狗脸
++//   文字模式：显示状态和对话文字
++// 长按 BOOT 键切换。
+ class DogDisplay : public OledDisplay {
+ public:
+     DogDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
+                int width, int height, bool mirror_x, bool mirror_y)
+         : OledDisplay(panel_io, panel, width, height, mirror_x, mirror_y) {}
+ 
++
++    ~DogDisplay() override {
++        if (face_visible_) {
++            DisplayLockGuard lock(this);
++            face_.Hide();
++        }
++    }
++
+     void SetChatMessage(const char* role, const char* content) override {
+         last_role_ = role ? role : "";
+         last_content_ = content ? content : "";
++        // 用户说的话里带表情关键词时，立刻切换表情（不依赖大模型工具调用）
++        if (last_role_ == "user" && content != nullptr) {
++            TryTriggerFaceByText(content);
++        }
+         if (text_visible_) {
+             OledDisplay::SetChatMessage(role, content);
+         }
+     }
+ 
+-    // 返回切换后的状态：true = 正在显示文字
++    // 关键词 -> 表情：本地匹配，响应快
++    void TryTriggerFaceByText(const std::string& text) {
++        struct Rule { const char* kw; const char* expr; };
++        static const Rule kRules[] = {
++            {"生气", "angry"},   {"气死", "angry"},
++            {"开心", "happy"},   {"高兴", "happy"},  {"笑一个", "happy"},
++            {"难过", "sad"},     {"伤心", "sad"},
++            {"惊讶", "surprised"}, {"吃惊", "surprised"},
++            {"睡觉", "sleepy"},  {"困了", "sleepy"},
++            {"喜欢", "love"},    {"爱你", "love"},
++            {"眨眼", "wink"},
++            {"平常", "neutral"}, {"正常", "neutral"},
++        };
++        for (const auto& r : kRules) {
++            if (text.find(r.kw) != std::string::npos) {
++                ShowTemporaryExpression(r.expr, 5000);
++                return;
++            }
++        }
++    }
++
++    void SetEmotion(const char* emotion) override {
++        if (face_visible_) {
++            DisplayLockGuard lock(this);
++            face_.SetEmotionName(emotion ? emotion : "");
++            return;
++        }
++        OledDisplay::SetEmotion(emotion);
++    }
++
++    void SetStatus(const char* status) override {
++        last_status_ = status ? status : "";
++        if (face_visible_) {
++            DisplayLockGuard lock(this);
++            face_.SetStatusName(last_status_);
++            return;
++        }
++        OledDisplay::SetStatus(status);
++    }
++
++    // 进入表情模式（开机调用一次）
++    void EnterFaceMode() {
++        text_visible_ = false;
++        face_visible_ = true;
++        OledDisplay::SetChatMessage("", "");
++        DisplayLockGuard lock(this);
++        face_.Show();
++        face_.SetStatusName(last_status_);
++    }
++
++    // 返回切换后的状态：true = 文字模式，false = 表情模式
+     bool ToggleTextVisible() {
+-        text_visible_ = !text_visible_;
+-        if (text_visible_) {
++        if (face_visible_) {
++            text_visible_ = true;
++            face_visible_ = false;
++            {
++                DisplayLockGuard lock(this);
++                face_.Hide();
++            }
+             OledDisplay::SetChatMessage(last_role_.c_str(), last_content_.c_str());
++            if (!last_status_.empty()) {
++                OledDisplay::SetStatus(last_status_.c_str());
++            }
+         } else {
+-            // 清空文字区域，只留表情和状态
++            text_visible_ = false;
++            face_visible_ = true;
+             OledDisplay::SetChatMessage("", "");
++            DisplayLockGuard lock(this);
++            face_.Show();
++            face_.SetStatusName(last_status_);
+         }
+         return text_visible_;
+     }
+ 
++    // 临时表情：显示指定表情，duration 毫秒后回到状态对应表情
++    void ShowTemporaryExpression(const char* name, int duration_ms = 4000) {
++        if (!face_visible_) {
++            EnterFaceMode();
++        }
++        {
++            DisplayLockGuard lock(this);
++            face_.SetEmotionName(name ? name : "");
++        }
++        if (temp_timer_ == nullptr) {
++            esp_timer_create_args_t args = {};
++            args.callback = [](void* arg) {
++                static_cast<DogDisplay*>(arg)->RestoreBaseExpression();
++            };
++            args.arg = this;
++            args.name = "face_restore";
++            esp_timer_create(&args, &temp_timer_);
++        }
++        esp_timer_stop(temp_timer_);
++        esp_timer_start_once(temp_timer_, (uint64_t)duration_ms * 1000);
++    }
++
++    void RestoreBaseExpression() {
++        if (!face_visible_) {
++            return;
++        }
++        DisplayLockGuard lock(this);
++        face_.SetStatusName(last_status_);
++    }
++
+     bool text_visible() const { return text_visible_; }
++    bool face_visible() const { return face_visible_; }
+ 
+ private:
+     std::string last_role_;
+     std::string last_content_;
+-    bool text_visible_ = true;
++    std::string last_status_;
++    bool text_visible_ = true;    // 启动阶段先显示文字提示
++    bool face_visible_ = false;   // 初始化完成后才切表情
++    esp_timer_handle_t temp_timer_ = nullptr;
++    DogFace face_;
+ };
+ 
+ #endif  // _DOG_DISPLAY_H_
+diff --git a/firmware/boards/esp32-dog-wangcai/dog_face.cc b/firmware/boards/esp32-dog-wangcai/dog_face.cc
+new file mode 100644
+index 0000000..0b9fce9
+--- /dev/null
++++ b/firmware/boards/esp32-dog-wangcai/dog_face.cc
+@@ -0,0 +1,488 @@
++#include "dog_face.h"
++
++#include <esp_log.h>
++
++#include <algorithm>
++
++#define TAG "DogFace"
++
++namespace {
++constexpr int kW = 128;
++constexpr int kH = 64;
++
++// 眼睛中心
++constexpr int kEyeLX = 42;
++constexpr int kEyeRX = 86;
++constexpr int kEyeY = 24;
++
++// 嘴巴中心
++constexpr int kMouthX = 64;
++constexpr int kMouthY = 50;
++
++lv_color_t White() { return lv_color_white(); }
++lv_color_t Black() { return lv_color_black(); }
++
++void BaseStyle(lv_obj_t* obj) {
++    lv_obj_set_style_pad_all(obj, 0, 0);
++    lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
++    lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
++}
++
++void Filled(lv_obj_t* obj, lv_color_t color) {
++    BaseStyle(obj);
++    lv_obj_set_style_bg_color(obj, color, 0);
++    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
++    lv_obj_set_style_border_width(obj, 0, 0);
++    lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, 0);
++}
++
++void Place(lv_obj_t* obj, int cx, int cy, int w, int h) {
++    lv_obj_set_size(obj, w, h);
++    lv_obj_set_pos(obj, cx - w / 2, cy - h / 2);
++}
++}  // namespace
++
++DogFace::~DogFace() {
++    if (timer_ != nullptr) {
++        lv_timer_delete(timer_);
++        timer_ = nullptr;
++    }
++    if (root_ != nullptr) {
++        lv_obj_del(root_);
++        root_ = nullptr;
++    }
++}
++
++void DogFace::EnsureCreated() {
++    // SetupUI 可能把界面重建过，导致原来的对象被清掉；这里做一次有效性检查
++    if (root_ != nullptr && !lv_obj_is_valid(root_)) {
++        root_ = nullptr;
++        eye_l_ = eye_r_ = nullptr;
++        pupil_l_ = pupil_r_ = nullptr;
++        arc_l_ = arc_r_ = nullptr;
++        brow_l_ = brow_r_ = nullptr;
++        blush_l_ = blush_r_ = nullptr;
++        mouth_arc_ = nullptr;
++        mouth_fill_ = nullptr;
++        heart_l_ = heart_r_ = nullptr;
++        heart_l_dot_ = heart_r_dot_ = nullptr;
++        zzz_ = nullptr;
++        visible_ = false;
++    }
++    if (root_ != nullptr) {
++        return;
++    }
++
++    auto screen = lv_screen_active();
++
++    root_ = lv_obj_create(screen);
++    lv_obj_set_size(root_, kW, kH);
++    lv_obj_set_pos(root_, 0, 0);
++    lv_obj_set_style_bg_color(root_, Black(), 0);
++    lv_obj_set_style_bg_opa(root_, LV_OPA_COVER, 0);
++    lv_obj_set_style_border_width(root_, 0, 0);
++    lv_obj_set_style_radius(root_, 0, 0);
++    BaseStyle(root_);
++    lv_obj_add_flag(root_, LV_OBJ_FLAG_HIDDEN);
++
++    // ---- 圆眼 ----
++    eye_l_ = lv_obj_create(root_);
++    Filled(eye_l_, White());
++    eye_r_ = lv_obj_create(root_);
++    Filled(eye_r_, White());
++
++    // 瞳孔（黑点）
++    pupil_l_ = lv_obj_create(eye_l_);
++    Filled(pupil_l_, Black());
++    pupil_r_ = lv_obj_create(eye_r_);
++    Filled(pupil_r_, Black());
++
++    // ---- 弧形眼 ----
++    arc_l_ = lv_arc_create(root_);
++    arc_r_ = lv_arc_create(root_);
++    lv_obj_t* arcs[] = {arc_l_, arc_r_};
++    for (auto* a : arcs) {
++        lv_obj_set_size(a, 34, 34);
++        BaseStyle(a);
++        lv_obj_set_style_bg_opa(a, LV_OPA_TRANSP, 0);
++        lv_obj_set_style_bg_opa(a, LV_OPA_TRANSP, LV_PART_KNOB);
++        lv_obj_set_style_border_width(a, 0, LV_PART_KNOB);
++        lv_obj_set_style_pad_all(a, 0, LV_PART_KNOB);
++        lv_obj_set_style_arc_color(a, White(), LV_PART_MAIN);
++        lv_obj_set_style_arc_color(a, White(), LV_PART_INDICATOR);
++        lv_obj_set_style_arc_width(a, 6, LV_PART_MAIN);
++        lv_obj_set_style_arc_width(a, 6, LV_PART_INDICATOR);
++    }
++
++    // ---- 眉毛 ----
++    brow_l_ = lv_obj_create(root_);
++    Filled(brow_l_, White());
++    lv_obj_set_style_radius(brow_l_, 2, 0);
++    brow_r_ = lv_obj_create(root_);
++    Filled(brow_r_, White());
++    lv_obj_set_style_radius(brow_r_, 2, 0);
++
++    // ---- 腮红 ----
++    blush_l_ = lv_obj_create(root_);
++    Filled(blush_l_, White());
++    lv_obj_set_style_radius(blush_l_, 2, 0);
++    blush_r_ = lv_obj_create(root_);
++    Filled(blush_r_, White());
++    lv_obj_set_style_radius(blush_r_, 2, 0);
++
++    // ---- 嘴巴 ----
++    mouth_arc_ = lv_arc_create(root_);
++    lv_obj_set_size(mouth_arc_, 46, 46);
++    BaseStyle(mouth_arc_);
++    lv_obj_set_style_bg_opa(mouth_arc_, LV_OPA_TRANSP, 0);
++    lv_obj_set_style_bg_opa(mouth_arc_, LV_OPA_TRANSP, LV_PART_KNOB);
++    lv_obj_set_style_border_width(mouth_arc_, 0, LV_PART_KNOB);
++    lv_obj_set_style_pad_all(mouth_arc_, 0, LV_PART_KNOB);
++    lv_obj_set_style_arc_color(mouth_arc_, White(), LV_PART_MAIN);
++    lv_obj_set_style_arc_color(mouth_arc_, White(), LV_PART_INDICATOR);
++    lv_obj_set_style_arc_width(mouth_arc_, 6, LV_PART_MAIN);
++    lv_obj_set_style_arc_width(mouth_arc_, 6, LV_PART_INDICATOR);
++
++    mouth_fill_ = lv_obj_create(root_);
++    Filled(mouth_fill_, White());
++
++    // ---- 爱心 ----
++    heart_l_ = lv_obj_create(root_);
++    Filled(heart_l_, White());
++    heart_r_ = lv_obj_create(root_);
++    Filled(heart_r_, White());
++    heart_l_dot_ = lv_obj_create(heart_l_);
++    Filled(heart_l_dot_, White());
++    lv_obj_set_style_radius(heart_l_dot_, 3, 0);
++    heart_r_dot_ = lv_obj_create(heart_r_);
++    Filled(heart_r_dot_, White());
++    lv_obj_set_style_radius(heart_r_dot_, 3, 0);
++
++    // ---- 睡觉的 Zz ----
++    zzz_ = lv_label_create(root_);
++    lv_label_set_text(zzz_, "z Z");
++    lv_obj_set_style_text_color(zzz_, White(), 0);
++    lv_obj_set_pos(zzz_, 96, 2);
++
++    timer_ = lv_timer_create(TickCb, 200, this);
++    Apply(expr_);
++}
++
++void DogFace::ShowPart(lv_obj_t* obj, bool show) {
++    if (obj == nullptr) {
++        return;
++    }
++    if (show) {
++        lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
++    } else {
++        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
++    }
++}
++
++void DogFace::ShowPair(lv_obj_t* a, lv_obj_t* b, bool show) {
++    ShowPart(a, show);
++    ShowPart(b, show);
++}
++
++void DogFace::SetArc(lv_obj_t* arc, int start_deg, int end_deg, int width) {
++    if (arc == nullptr) {
++        return;
++    }
++    lv_arc_set_bg_angles(arc, start_deg, end_deg);
++    lv_arc_set_angles(arc, start_deg, end_deg);
++    lv_obj_set_style_arc_width(arc, width, LV_PART_MAIN);
++    lv_obj_set_style_arc_width(arc, width, LV_PART_INDICATOR);
++}
++
++void DogFace::Apply(Expression e) {
++    expr_ = e;
++    if (root_ == nullptr) {
++        return;
++    }
++
++    // 先全部隐藏，再按表情打开
++    ShowPair(eye_l_, eye_r_, false);
++    ShowPair(pupil_l_, pupil_r_, false);
++    ShowPair(arc_l_, arc_r_, false);
++    ShowPair(brow_l_, brow_r_, false);
++    ShowPair(blush_l_, blush_r_, false);
++    ShowPair(heart_l_, heart_r_, false);
++    ShowPair(heart_l_dot_, heart_r_dot_, false);
++    ShowPart(mouth_arc_, false);
++    ShowPart(mouth_fill_, false);
++    ShowPart(zzz_, false);
++
++    const int eye_d = 26;
++    const int pupil_d = 9;
++
++    auto round_eyes = [this](int d, int pd, int lx, int rx, int y) {
++        Place(eye_l_, lx, y, d, d);
++        Place(eye_r_, rx, y, d, d);
++        ShowPair(eye_l_, eye_r_, true);
++        lv_obj_center(pupil_l_);
++        lv_obj_center(pupil_r_);
++        lv_obj_set_size(pupil_l_, pd, pd);
++        lv_obj_set_size(pupil_r_, pd, pd);
++        ShowPair(pupil_l_, pupil_r_, true);
++    };
++
++    switch (e) {
++        case kHappy: {
++            Place(arc_l_, kEyeLX, kEyeY, 34, 34);
++            Place(arc_r_, kEyeRX, kEyeY, 34, 34);
++            SetArc(arc_l_, 200, 340, 7);
++            SetArc(arc_r_, 200, 340, 7);
++            ShowPair(arc_l_, arc_r_, true);
++
++            Place(blush_l_, 16, 40, 12, 4);
++            Place(blush_r_, 112, 40, 12, 4);
++            ShowPair(blush_l_, blush_r_, true);
++
++            Place(mouth_fill_, kMouthX, 50, 22, 10);
++            lv_obj_set_style_radius(mouth_fill_, 5, 0);
++            ShowPart(mouth_fill_, true);
++            break;
++        }
++
++        case kWink: {
++            Place(eye_l_, kEyeLX, kEyeY, 26, 26);
++            ShowPart(eye_l_, true);
++            lv_obj_center(pupil_l_);
++            lv_obj_set_size(pupil_l_, pupil_d, pupil_d);
++            ShowPart(pupil_l_, true);
++
++            Place(arc_r_, kEyeRX, kEyeY, 34, 34);
++            SetArc(arc_r_, 200, 340, 7);
++            ShowPart(arc_r_, true);
++
++            Place(blush_l_, 16, 40, 12, 4);
++            Place(blush_r_, 112, 40, 12, 4);
++            ShowPair(blush_l_, blush_r_, true);
++
++            Place(mouth_fill_, kMouthX, 50, 20, 9);
++            lv_obj_set_style_radius(mouth_fill_, 5, 0);
++            ShowPart(mouth_fill_, true);
++            break;
++        }
++
++        case kSurprised: {
++            Place(eye_l_, kEyeLX, kEyeY, 30, 30);
++            Place(eye_r_, kEyeRX, kEyeY, 30, 30);
++            ShowPair(eye_l_, eye_r_, true);
++            lv_obj_center(pupil_l_);
++            lv_obj_center(pupil_r_);
++            lv_obj_set_size(pupil_l_, 11, 11);
++            lv_obj_set_size(pupil_r_, 11, 11);
++            ShowPair(pupil_l_, pupil_r_, true);
++
++            Place(mouth_fill_, kMouthX, kMouthY, 12, 12);
++            lv_obj_set_style_radius(mouth_fill_, LV_RADIUS_CIRCLE, 0);
++            ShowPart(mouth_fill_, true);
++            break;
++        }
++
++        case kSleepy: {
++            Place(arc_l_, kEyeLX, kEyeY, 34, 34);
++            Place(arc_r_, kEyeRX, kEyeY, 34, 34);
++            SetArc(arc_l_, 200, 340, 6);
++            SetArc(arc_r_, 200, 340, 6);
++            ShowPair(arc_l_, arc_r_, true);
++
++            Place(mouth_fill_, kMouthX, kMouthY + 2, 16, 5);
++            lv_obj_set_style_radius(mouth_fill_, 2, 0);
++            ShowPart(mouth_fill_, true);
++            ShowPart(zzz_, true);
++            break;
++        }
++
++        case kAngry: {
++            Place(eye_l_, kEyeLX, kEyeY + 3, 16, 16);
++            Place(eye_r_, kEyeRX, kEyeY + 3, 16, 16);
++            ShowPair(eye_l_, eye_r_, true);
++
++            Place(brow_l_, kEyeLX + 3, kEyeY - 14, 18, 4);
++            Place(brow_r_, kEyeRX - 3, kEyeY - 14, 18, 4);
++            ShowPair(brow_l_, brow_r_, true);
++
++            Place(mouth_fill_, kMouthX, kMouthY + 4, 20, 5);
++            lv_obj_set_style_radius(mouth_fill_, 2, 0);
++            ShowPart(mouth_fill_, true);
++            break;
++        }
++
++        case kLove: {
++            // 心形：上方两块圆角 + 下方小方块
++            Place(heart_l_, kEyeLX, kEyeY - 2, 30, 24);
++            lv_obj_set_style_radius(heart_l_, 11, 0);
++            Place(heart_r_, kEyeRX, kEyeY - 2, 30, 24);
++            lv_obj_set_style_radius(heart_r_, 11, 0);
++            ShowPair(heart_l_, heart_r_, true);
++
++            Place(heart_l_dot_, 0, 0, 12, 12);
++            lv_obj_set_pos(heart_l_dot_, 9, 12);
++            Place(heart_r_dot_, 0, 0, 12, 12);
++            lv_obj_set_pos(heart_r_dot_, 9, 12);
++            ShowPair(heart_l_dot_, heart_r_dot_, true);
++
++            Place(mouth_fill_, kMouthX, 50, 20, 9);
++            lv_obj_set_style_radius(mouth_fill_, 5, 0);
++            ShowPart(mouth_fill_, true);
++            break;
++        }
++
++        case kListening: {
++            round_eyes(28, 10, kEyeLX, kEyeRX, kEyeY);
++            Place(mouth_fill_, kMouthX, kMouthY, 18, 8);
++            lv_obj_set_style_radius(mouth_fill_, 4, 0);
++            ShowPart(mouth_fill_, true);
++            break;
++        }
++
++        case kSpeaking: {
++            round_eyes(26, 9, kEyeLX, kEyeRX, kEyeY);
++            Place(mouth_fill_, kMouthX, kMouthY, 26, 12);
++            lv_obj_set_style_radius(mouth_fill_, 6, 0);
++            ShowPart(mouth_fill_, true);
++            break;
++        }
++
++        case kThinking: {
++            Place(eye_l_, kEyeLX, kEyeY, 28, 28);
++            Place(eye_r_, kEyeRX, kEyeY, 18, 18);
++            ShowPair(eye_l_, eye_r_, true);
++            lv_obj_center(pupil_l_);
++            lv_obj_center(pupil_r_);
++            lv_obj_set_size(pupil_l_, 10, 10);
++            lv_obj_set_size(pupil_r_, 7, 7);
++            ShowPair(pupil_l_, pupil_r_, true);
++
++            Place(mouth_fill_, 74, kMouthY, 16, 5);
++            lv_obj_set_style_radius(mouth_fill_, 2, 0);
++            ShowPart(mouth_fill_, true);
++            break;
++        }
++
++        case kSad: {
++            round_eyes(22, 8, kEyeLX, kEyeRX, kEyeY);
++            Place(brow_l_, kEyeLX - 4, kEyeY - 12, 18, 4);
++            Place(brow_r_, kEyeRX + 4, kEyeY - 12, 18, 4);
++            ShowPair(brow_l_, brow_r_, true);
++
++            Place(mouth_arc_, kMouthX, 52, 34, 34);
++            SetArc(mouth_arc_, 20, 160, 5);
++            ShowPart(mouth_arc_, true);
++            break;
++        }
++
++        case kNeutral:
++        default: {
++            round_eyes(eye_d, pupil_d, kEyeLX, kEyeRX, kEyeY);
++            Place(mouth_fill_, kMouthX, kMouthY, 22, 5);
++            lv_obj_set_style_radius(mouth_fill_, 2, 0);
++            ShowPart(mouth_fill_, true);
++            break;
++        }
++    }
++}
++
++void DogFace::SetExpression(Expression e) {
++    EnsureCreated();
++    Apply(e);
++}
++
++void DogFace::SetEmotionName(const std::string& name) {
++    std::string n = name;
++    std::transform(n.begin(), n.end(), n.begin(), ::tolower);
++    auto has = [&n](const char* kw) { return n.find(kw) != std::string::npos; };
++
++    if (has("happy") || has("joy") || has("开心") || has("高兴")) {
++        SetExpression(kHappy);
++    } else if (has("wink") || has("眨眼")) {
++        SetExpression(kWink);
++    } else if (has("sad") || has("cry") || has("难过") || has("伤心")) {
++        SetExpression(kSad);
++    } else if (has("angry") || has("mad") || has("生气")) {
++        SetExpression(kAngry);
++    } else if (has("surprised") || has("shock") || has("惊讶")) {
++        SetExpression(kSurprised);
++    } else if (has("sleepy") || has("tired") || has("困") || has("睡")) {
++        SetExpression(kSleepy);
++    } else if (has("love") || has("like") || has("喜欢")) {
++        SetExpression(kLove);
++    } else if (has("thinking") || has("think") || has("思考")) {
++        SetExpression(kThinking);
++    } else {
++        SetExpression(kNeutral);
++    }
++}
++
++void DogFace::SetStatusName(const std::string& status) {
++    if (status.find("聆听") != std::string::npos || status.find("listen") != std::string::npos) {
++        SetExpression(kListening);
++    } else if (status.find("说话") != std::string::npos || status.find("speak") != std::string::npos) {
++        SetExpression(kSpeaking);
++    } else if (status.find("思考") != std::string::npos || status.find("think") != std::string::npos) {
++        SetExpression(kThinking);
++    } else if (status.find("连接") != std::string::npos || status.find("connect") != std::string::npos) {
++        SetExpression(kSleepy);
++    } else {
++        SetExpression(kNeutral);
++    }
++}
++
++void DogFace::Show() {
++    EnsureCreated();
++    lv_obj_remove_flag(root_, LV_OBJ_FLAG_HIDDEN);
++    lv_obj_move_foreground(root_);
++    visible_ = true;
++    Apply(expr_);
++}
++
++void DogFace::Hide() {
++    visible_ = false;
++    if (root_ != nullptr) {
++        lv_obj_add_flag(root_, LV_OBJ_FLAG_HIDDEN);
++    }
++}
++
++void DogFace::TickCb(lv_timer_t* timer) {
++    auto* self = static_cast<DogFace*>(lv_timer_get_user_data(timer));
++    if (self != nullptr && self->visible_) {
++        self->TickCbImpl();
++    }
++}
++
++void DogFace::TickCbImpl() {
++    tick_++;
++
++    // 保险：每约 2 秒把表情层提到最前面，
++    // 避免状态栏 / 通知等文字对象被重新绘制到表情之上。
++    if (tick_ % 10 == 0 && root_ != nullptr && lv_obj_is_valid(root_)) {
++        lv_obj_move_foreground(root_);
++    }
++
++    // 说话时嘴巴开合
++    if (expr_ == kSpeaking) {
++        int h = (tick_ % 4 < 2) ? 8 : 16;
++        Place(mouth_fill_, kMouthX, kMouthY, 26, h);
++    }
++
++    // 平常状态每约 3 秒眨一次
++    if (blink_ticks_ > 0) {
++        blink_ticks_--;
++        if (blink_ticks_ == 0) {
++            Apply(expr_);
++        }
++        return;
++    }
++    if (tick_ % 15 == 0 && (expr_ == kNeutral || expr_ == kListening)) {
++        blink_ticks_ = 1;
++        ShowPair(eye_l_, eye_r_, false);
++        ShowPair(pupil_l_, pupil_r_, false);
++        Place(arc_l_, kEyeLX, kEyeY, 34, 34);
++        Place(arc_r_, kEyeRX, kEyeY, 34, 34);
++        SetArc(arc_l_, 200, 340, 5);
++        SetArc(arc_r_, 200, 340, 5);
++        ShowPair(arc_l_, arc_r_, true);
++    }
++}
+diff --git a/firmware/boards/esp32-dog-wangcai/dog_face.h b/firmware/boards/esp32-dog-wangcai/dog_face.h
+new file mode 100644
+index 0000000..40a0628
+--- /dev/null
++++ b/firmware/boards/esp32-dog-wangcai/dog_face.h
+@@ -0,0 +1,90 @@
++#ifndef _DOG_FACE_H_
++#define _DOG_FACE_H_
++
++#include <lvgl.h>
++
++#include <string>
++
++// 128x64 单色 OLED 上的机器人狗脸（参考主流表情设计）：
++//   大圆眼 + 瞳孔高光 + 弧线嘴 + 腮红，
++//   开心 / 眨眼 / 惊讶 / 睡觉 / 生气 / 喜欢 各有独立画法。
++// 全部用 LVGL 图元拼出来，不依赖表情字库。
++class DogFace {
++public:
++    enum Expression {
++        kNeutral,    // 平常
++        kHappy,      // 开心
++        kWink,       // 眨眼
++        kSurprised,  // 惊讶
++        kSleepy,     // 睡觉
++        kAngry,      // 生气
++        kLove,       // 喜欢
++        kListening,  // 正在听
++        kSpeaking,   // 正在说
++        kThinking,   // 思考
++        kSad,        // 难过
++    };
++
++    DogFace() = default;
++    ~DogFace();
++
++    void Show();
++    void Hide();
++    bool visible() const { return visible_; }
++
++    void SetExpression(Expression e);
++    void SetEmotionName(const std::string& name);
++    void SetStatusName(const std::string& status);
++
++    Expression expression() const { return expr_; }
++
++private:
++    void EnsureCreated();
++    void Apply(Expression e);
++    void ShowPart(lv_obj_t* obj, bool show);
++    void ShowPair(lv_obj_t* a, lv_obj_t* b, bool show);
++    void SetArc(lv_obj_t* arc, int start_deg, int end_deg, int width);
++    void TickCbImpl();
++    static void TickCb(lv_timer_t* timer);
++
++    lv_obj_t* root_ = nullptr;
++
++    // 圆眼（白圆）+ 瞳孔（黑点）
++    lv_obj_t* eye_l_ = nullptr;
++    lv_obj_t* eye_r_ = nullptr;
++    lv_obj_t* pupil_l_ = nullptr;
++    lv_obj_t* pupil_r_ = nullptr;
++
++    // 弧形眼（开心 / 睡觉 / 眨眼）
++    lv_obj_t* arc_l_ = nullptr;
++    lv_obj_t* arc_r_ = nullptr;
++
++    // 眉毛
++    lv_obj_t* brow_l_ = nullptr;
++    lv_obj_t* brow_r_ = nullptr;
++
++    // 腮红
++    lv_obj_t* blush_l_ = nullptr;
++    lv_obj_t* blush_r_ = nullptr;
++
++    // 嘴巴：弧线（笑 / 撇嘴）与实心（张嘴 / o 形）
++    lv_obj_t* mouth_arc_ = nullptr;
++    lv_obj_t* mouth_fill_ = nullptr;
++
++    // 爱心眼（喜欢）：两个圆 + 下方一块方块拼成心形
++    lv_obj_t* heart_l_ = nullptr;
++    lv_obj_t* heart_r_ = nullptr;
++    lv_obj_t* heart_l_dot_ = nullptr;
++    lv_obj_t* heart_r_dot_ = nullptr;
++
++    // 睡觉的 Zz
++    lv_obj_t* zzz_ = nullptr;
++
++    lv_timer_t* timer_ = nullptr;
++    Expression expr_ = kNeutral;
++    bool visible_ = false;
++    int tick_ = 0;
++    int blink_ticks_ = 0;
++};
++
++#endif  // _DOG_FACE_H_
+diff --git a/firmware/patches/README.md b/firmware/patches/README.md
+index bf87bcf..b76b162 100644
+--- a/firmware/patches/README.md
++++ b/firmware/patches/README.md
+@@ -98,4 +98,40 @@ MultiNet 支持用拼音自定义命令词，因此改用该方案，避免定
+ ```
+ 
+ **原因**：让同一份源码既能入库（只有占位符），又能直接在本机编译出带真实地址和令牌的固件。
+-`config_local.h` 已在 `.gitignore` 中，不会被提交。
+\ No newline at end of file
++`config_local.h` 已在 `.gitignore` 中，不会被提交。
++
++---
++
++## 6. 新增表情模块（板级，非 patch）
++
++`main/boards/esp32-dog-wangcai/dog_face.h/.cc` 为新增文件，用 LVGL 图元绘制 11 种表情：
++平常 / 开心 / 眨眼 / 惊讶 / 睡觉 / 生气 / 喜欢 / 聆听 / 说话 / 思考 / 难过。
++含眨眼动画（约 3 秒一次）与说话时嘴巴开合。
++
++`dog_display.h` 在 `OledDisplay` 之上加两种模式：表情模式与文字模式，长按 BOOT 键切换。
++
++## 7. 启动阶段显示时序
++
++`dog_board.cc` 中新增 `StartFaceSwitchTask()`：启动阶段先显示文字提示
++（连接中 / 注册中 / 初始化），设备进入待命或对话状态后再切到表情界面。
++
++按钮长按阈值从默认 0 改为 800ms（`Button(gpio, false, 800, 50)`），
++否则长按回调不会触发。
++
++## 8. 唤醒词运行时下发（改上游文件）
++
++**`main/audio/wake_words/custom_wake_word.cc/.h`**
++
++- 新增 `LoadSavedWakeWords()` / `SaveWakeWords()`：从 NVS 键 `wifi/wake_pinyin` 读写，
++  多个词用 `|` 分隔。
++- 新增 `ReloadWakeWords(pinyins)`：`esp_mn_commands_clear()` →
++  `esp_mn_commands_add()` → `esp_mn_commands_update()`，重建后写入 NVS。
++- `Initialize()` 中优先使用 NVS 中的词表，没有才用编译默认值。
++- 编译默认值保留四个说法：你好小慧 / 小慧小慧 / 嘿小慧 / 小慧。
++
++**`main/boards/esp32-dog-wangcai/dog_board.cc`**
++
++- 心跳响应里解析 `config.wake_words`（控制台下发的中文唤醒词已转为拼音），
++  与 NVS 中的词表比较，不同则调用 `ReloadWakeWords()`。
++
++因此**换唤醒词不需要重新编译固件**，在控制台改完等一次心跳即可。
+\ No newline at end of file
+-- 
+2.54.0.windows.1
+

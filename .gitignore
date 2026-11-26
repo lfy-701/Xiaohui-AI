@@ -1,0 +1,36 @@
+# 依赖与虚拟环境
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 模型与缓存（体积大，需自行下载）
+models/
+.mscache/
+.hfhome/
+.home/
+*.onnx
+
+# 密钥与本地配置
+.env
+*.local
+data/voice_settings.json
+data/voice_settings.json.bak*
+tmp/
+logs/
+*.log
+
+# 运行产物
+data/firmware/
+data/music/
+data/tmp/
+exports/
+dist/
+build/
+*.zip
+
+# 系统
+.DS_Store
+Thumbs.db

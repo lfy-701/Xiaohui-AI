@@ -1,0 +1,402 @@
+"""控制台控制接口：把按钮/外部请求转成设备端 MCP 工具调用。
+
+路由（挂在语音服务的 HTTP 端口，默认 8003）：
+- GET  /api/console/status  查看当前在线的语音连接与 MCP 状态
+- POST /api/console/action  调用设备 MCP 工具（默认 self.dog_action）
+
+为什么不走控制台心跳队列：
+设备与语音服务之间本来就有一条 WebSocket，MCP 工具也已经在上面握手完成，
+直接复用这条通道，动作延迟是「一次往返」，不用等下一次心跳。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from typing import Any, Dict, List, Optional
+
+from aiohttp import web
+
+from core.api.base_handler import BaseHandler
+from core.providers.tools.device_mcp import call_mcp_tool
+from core.utils.console_actions import (
+    ACTION_LABELS,
+    DOG_ACTION_TOOL,
+    DOG_ACTION_TOOL_ORIGINAL,
+    action_arguments,
+    public_action_list,
+)
+from core.utils.util import sanitize_tool_name
+
+TAG = __name__
+
+# 设备偶发卡顿时别把 HTTP 请求拖死
+DEFAULT_TIMEOUT = 8.0
+
+
+class ConsoleActionHandler(BaseHandler):
+    def __init__(self, config: dict, ws_server=None):
+        super().__init__(config)
+        self.ws_server = ws_server
+
+    # ------------------------------------------------------------ 基础工具
+
+    def _connections(self) -> List[Any]:
+        if self.ws_server is None:
+            return []
+        return list(getattr(self.ws_server, "active_connections", []) or [])
+
+    async def _pick_connection(self, device_id: str = "") -> Optional[Any]:
+        """挑一个可用连接：优先指定设备，其次最近活跃的。"""
+        wanted = (device_id or "").strip().lower()
+        candidates = []
+        for conn in self._connections():
+            client = getattr(conn, "mcp_client", None)
+            if client is None:
+                continue
+            if wanted and (getattr(conn, "device_id", "") or "").lower() != wanted:
+                continue
+            try:
+                if not await client.is_ready():
+                    continue
+            except Exception:
+                continue
+            candidates.append(conn)
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda c: float(getattr(c, "last_activity_time", 0) or 0),
+            reverse=True,
+        )
+        return candidates[0]
+
+    @staticmethod
+    def _json(data: Dict[str, Any], status: int = 200) -> web.Response:
+        return web.Response(
+            text=json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+            content_type="application/json",
+            status=status,
+        )
+
+    def _respond(self, data: Dict[str, Any], status: int = 200) -> web.Response:
+        response = self._json(data, status)
+        self._add_cors_headers(response)
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        return response
+
+    # ------------------------------------------------------------ 路由
+
+    async def handle_options(self, request):
+        response = web.Response(status=204)
+        self._add_cors_headers(response)
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        return response
+
+    async def handle_status(self, request):
+        """给控制台看的轻量状态：有哪些设备连接、MCP 是否就绪。"""
+        devices = []
+        for conn in self._connections():
+            client = getattr(conn, "mcp_client", None)
+            ready = False
+            tool_count = 0
+            if client is not None:
+                try:
+                    ready = await client.is_ready()
+                except Exception:
+                    ready = False
+                try:
+                    tool_count = len(getattr(client, "tools", {}) or {})
+                except Exception:
+                    tool_count = 0
+            last = float(getattr(conn, "last_activity_time", 0) or 0)
+            devices.append(
+                {
+                    "device_id": getattr(conn, "device_id", "") or "",
+                    "mcp_ready": ready,
+                    "tools": tool_count,
+                    "last_activity_ago": round(max(0.0, time.time() - last / 1000.0), 1)
+                    if last
+                    else None,
+                }
+            )
+        devices.sort(key=lambda d: d["mcp_ready"], reverse=True)
+        return self._respond(
+            {
+                "ok": True,
+                "online": any(d["mcp_ready"] for d in devices),
+                "count": len(devices),
+                "devices": devices,
+                "actions": public_action_list(),
+            }
+        )
+
+    async def handle_chat(self, request):
+        '''POST /api/console/chat 让设备按正常对话流程回应。'''
+        try:
+            body = await request.json()
+        except Exception:
+            return self._respond({'ok': False, 'error': '请求体不是合法 JSON'}, 400)
+
+        text = str((body or {}).get('text') or '').strip()
+        if not text:
+            return self._respond({'ok': False, 'error': '缺少 text'}, 400)
+
+        conn = await self._pick_connection(str((body or {}).get('device_id') or ''))
+        if conn is None:
+            return self._respond({'ok': False, 'error': '设备当前不在线'}, 409)
+
+        try:
+            import asyncio as _aio
+
+            conn.client_abort = False
+            loop = _aio.get_running_loop()
+            # chat 是同步函数（正常流程里用线程池提交），这里同样丢到线程池
+            await _aio.wait_for(loop.run_in_executor(None, conn.chat, text), timeout=90)
+        except Exception as e:
+            return self._respond({'ok': False, 'error': '对话失败：' + str(e)}, 500)
+
+        reply = ''
+        try:
+            msgs = getattr(conn.dialogue, 'messages', []) or []
+            for m in reversed(msgs):
+                role = m.get('role') if isinstance(m, dict) else getattr(m, 'role', '')
+                if role == 'assistant':
+                    reply = m.get('content') if isinstance(m, dict) else getattr(m, 'content', '')
+                    break
+        except Exception:
+            pass
+
+        return self._respond({'ok': True, 'spoken': True, 'reply': reply})
+    async def handle_say(self, request):
+        """POST /api/console/say  {"text": "我在，你说。"}
+
+        让当前在线的设备把这段文字说出来（TTS + 已有的音频通道）。
+        """
+        import io
+
+        try:
+            body = await request.json()
+        except Exception:
+            return self._respond({"ok": False, "error": "请求体不是合法 JSON"}, 400)
+
+        text = str((body or {}).get("text") or "").strip()
+        if not text:
+            return self._respond({"ok": False, "error": "缺少 text"}, 400)
+        if len(text) > 300:
+            text = text[:300]
+
+        device_id = str((body or {}).get("device_id") or "").strip()
+        conn = await self._pick_connection(device_id)
+        if conn is None:
+            return self._respond(
+                {"ok": False, "error": "设备当前不在线（需要先语音唤醒）"}, 409
+            )
+
+        tts = getattr(conn, "tts", None)
+        if tts is None:
+            return self._respond({"ok": False, "error": "语音合成未就绪"}, 503)
+
+        try:
+            audio = await tts.text_to_speak(text, None)
+        except Exception as e:
+            return self._respond({"ok": False, "error": f"合成失败：{e}"}, 500)
+        if not audio:
+            return self._respond({"ok": False, "error": "合成结果为空"}, 500)
+
+        # MP3 -> 24k 单声道 PCM -> 24k Opus（设备播放通道是 24kHz）
+        try:
+            import asyncio as _asyncio
+            import os as _os
+            import subprocess
+            import tempfile
+
+            import numpy as _np
+            import opuslib_next as _opus
+
+            ffmpeg = None
+            try:
+                import imageio_ffmpeg
+                ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception:
+                ffmpeg = "ffmpeg"
+
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as fp:
+                fp.write(audio)
+                tmp_path = fp.name
+
+            try:
+                proc = subprocess.run(
+                    [ffmpeg, "-v", "quiet", "-nostdin", "-i", tmp_path,
+                     "-f", "s16le", "-acodec", "pcm_s16le",
+                     "-ar", "24000", "-ac", "1", "-"],
+                    capture_output=True, timeout=30,
+                )
+                if proc.returncode != 0 or not proc.stdout:
+                    raise RuntimeError((proc.stderr or b"")[:200].decode("utf-8", "ignore"))
+                pcm = proc.stdout
+            finally:
+                try:
+                    _os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+            encoder = _opus.Encoder(24000, 1, _opus.APPLICATION_AUDIO)
+            frame = 1440  # 24000Hz * 60ms
+            stride = frame * 2
+            opus_packets = []
+            for i in range(0, len(pcm), stride):
+                chunk = pcm[i:i + stride]
+                if len(chunk) < stride:
+                    chunk = chunk + b"\x00" * (stride - len(chunk))
+                _np.frombuffer(chunk, dtype=_np.int16)  # 校验可解析
+                opus_packets.append(encoder.encode(chunk, frame))
+        except Exception as e:
+            return self._respond({"ok": False, "error": f"编码失败：{e}"}, 500)
+
+        # 与正常 TTS 相同的发送方式：FIRST 带整句音频 + 文本
+        try:
+            from core.handle.sendAudioHandle import sendAudioMessage
+            from core.providers.tts.dto.dto import SentenceType
+
+            import asyncio as _aio
+            from core.handle.sendAudioHandle import send_tts_message
+
+            conn.client_abort = False
+            # 关键：先发 tts start，设备才会切到「说话」状态，否则音频被丢弃
+            await send_tts_message(conn, "start")
+            await sendAudioMessage(conn, SentenceType.FIRST, opus_packets, text)
+            await sendAudioMessage(conn, SentenceType.LAST, [], None)
+            await send_tts_message(conn, "stop")
+        except Exception as e:
+            return self._respond({"ok": False, "error": f"发送失败：{e}"}, 500)
+
+        return self._respond({"ok": True, "said": text, "packets": len(opus_packets)})
+
+
+    async def handle_play(self, request):
+        """POST /api/console/play  {"url": "..."}  播放网络音频（音乐）。"""
+        import os
+        import subprocess
+        import tempfile
+
+        import opuslib_next as opus
+
+        try:
+            body = await request.json()
+        except Exception:
+            return self._respond({"ok": False, "error": "请求体不是合法 JSON"}, 400)
+
+        url = str((body or {}).get("url") or "").strip()
+        if not url.startswith("http"):
+            return self._respond({"ok": False, "error": "缺少合法的 url"}, 400)
+
+        conn = await self._pick_connection(str((body or {}).get("device_id") or ""))
+        if conn is None:
+            return self._respond({"ok": False, "error": "设备当前不在线"}, 409)
+
+        ffmpeg = "ffmpeg"
+        try:
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
+
+        from core.handle.sendAudioHandle import sendAudioMessage, send_tts_message
+        from core.providers.tts.dto.dto import SentenceType
+
+        async def _stream():
+            sent = 0
+            tmp = None
+            try:
+                import asyncio as _aio
+                import httpx as _httpx
+
+                async with _httpx.AsyncClient(timeout=60.0, follow_redirects=True) as hc:
+                    resp = await hc.get(url)
+                    resp.raise_for_status()
+                    data = resp.content
+
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as fp:
+                    fp.write(data)
+                    tmp = fp.name
+
+                loop = asyncio.get_running_loop()
+                proc = await loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(
+                        [ffmpeg, "-v", "error", "-nostdin", "-i", tmp,
+                         "-f", "s16le", "-acodec", "pcm_s16le",
+                         "-ar", "24000", "-ac", "1", "pipe:1"],
+                        capture_output=True, timeout=90,
+                    ),
+                )
+                pcm = proc.stdout or b""
+                if not pcm:
+                    conn.logger.bind(tag="Play").warning("解码无输出")
+                    return
+                conn.logger.bind(tag="Play").info(f"已解码 {len(pcm)} 字节 PCM")
+
+                encoder = opus.Encoder(24000, 1, opus.APPLICATION_AUDIO)
+                encoder.bitrate = 24000
+                frame = 1440
+                stride = frame * 2
+                packets = []
+                for i in range(0, len(pcm), stride):
+                    chunk = pcm[i:i + stride]
+                    if len(chunk) < stride:
+                        chunk = chunk + b"\x00" * (stride - len(chunk))
+                    packets.append(encoder.encode(chunk, frame))
+
+                conn.client_abort = False
+                await send_tts_message(conn, "start")
+                await sendAudioMessage(conn, SentenceType.FIRST, packets[:3], "")
+                await asyncio.sleep(0.05)
+
+                i = 3
+                while i < len(packets):
+                    if getattr(conn, "client_abort", False):
+                        conn.logger.bind(tag="Play").info("播放被用户打断")
+                        break
+                    await sendAudioMessage(conn, SentenceType.MIDDLE, packets[i:i + 1], None)
+                    i += 1
+                    await asyncio.sleep(0.055)
+                sent = i
+
+                try:
+                    await sendAudioMessage(conn, SentenceType.LAST, [], None)
+                    await send_tts_message(conn, "stop")
+                except Exception:
+                    pass
+            except Exception as e:
+                conn.logger.bind(tag="Play").warning(f"播放失败: {e}")
+            finally:
+                try:
+                    if tmp and os.path.exists(tmp):
+                        os.unlink(tmp)
+                except Exception:
+                    pass
+                conn.logger.bind(tag="Play").info(f"播放结束：{sent} 帧 / {sent * 0.06:.1f} 秒")
+
+        asyncio.create_task(_stream())
+        return self._respond({"ok": True, "async": True, "stream": True})
+
+    async def handle_stop(self, request):
+        """POST /api/console/stop  停止当前播放（音乐/播报）。"""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        conn = await self._pick_connection(str((body or {}).get("device_id") or ""))
+        if conn is None:
+            return self._respond({"ok": False, "error": "设备当前不在线"}, 409)
+        try:
+            conn.client_abort = True
+        except Exception:
+            pass
+        try:
+            from core.handle.sendAudioHandle import send_tts_message
+            await send_tts_message(conn, "stop")
+        except Exception:
+            pass
+        return self._respond({"ok": True, "stopped": True})
